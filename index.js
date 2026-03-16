@@ -15,8 +15,8 @@ const CTRADER_REFRESH_TOKEN = process.env.CTRADER_REFRESH_TOKEN;
 const IS_PAPER = process.env.IS_PAPER === 'true';  // 'true' for paper, 'false' for live
 
 const CTRADER_API = IS_PAPER
-  ? 'https://demo.ctraderapi.com'  // Paper/demo endpoint
-  : 'https://live.ctraderapi.com'; // Live endpoint — only switch when ready
+  ? 'https://api.ctraderapi.com'  // Paper/demo endpoint
+  : 'https://api.ctraderapi.com'; // Live endpoint — only switch when ready
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
