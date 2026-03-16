@@ -1,10 +1,10 @@
-// Hawk Execution Engine — index.js v1.7
+// Hawk Execution Engine — index.js v1.8
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient } = require("@supabase/supabase-js");
 
-console.log("=== HAWK ENGINE v1.7 STARTING ===");
+console.log("=== HAWK ENGINE v1.8 STARTING ===");
 
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -21,10 +21,13 @@ console.log("IS_PAPER:", IS_PAPER, "| HOST:", HOST, "| ACCOUNT_ID:", ACCOUNT_ID)
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// cTrader volume units for XAUUSD on Pepperstone:
+// 1 unit = 0.01 lots. Sending 100 = 1 lot, 10 = 0.10 lots, 1 = 0.01 lots
+// Testing with 100 (= 0.01 lots in cTrader cents convention)
 function getVolume(score) {
-  if (score >= 9) return 3;
-  if (score >= 8) return 2;
-  return 1;
+  if (score >= 9) return 300;  // 0.03 lots
+  if (score >= 8) return 200;  // 0.02 lots
+  return 100;                   // 0.01 lots
 }
 
 const seenSignals = new Map();
@@ -74,20 +77,19 @@ async function main() {
   await connection.open();
   console.log("Connection opened");
 
-  // Listen for ALL execution events from cTrader
-  connection.on("ProtoOAExecutionEvent", (event) => {
-    console.log("EXECUTION EVENT received:", JSON.stringify(event));
+  // Listen for execution and error events
+  connection.on("ProtoOAExecutionEvent", (e) => {
+    console.log("EXECUTION EVENT:", JSON.stringify(e));
   });
-
-  // Listen for error events
-  connection.on("ProtoOAErrorRes", (event) => {
-    console.error("cTrader ERROR event:", JSON.stringify(event));
+  connection.on("ProtoOAOrderErrorEvent", (e) => {
+    console.error("ORDER ERROR EVENT:", JSON.stringify(e));
   });
-
-  // Listen for order error events
-  connection.on("ProtoOAOrderErrorEvent", (event) => {
-    console.error("ORDER ERROR event:", JSON.stringify(event));
+  connection.on("ProtoOAErrorRes", (e) => {
+    console.error("ERROR RES EVENT:", JSON.stringify(e));
   });
+  // Numeric payload type fallbacks
+  connection.on("2132", (e) => console.error("ORDER ERROR (2132):", JSON.stringify(e)));
+  connection.on("2126", (e) => console.log("EXECUTION (2126):", JSON.stringify(e)));
 
   await connection.sendCommand("ProtoOAApplicationAuthReq", {
     clientId: CLIENT_ID,
@@ -110,7 +112,10 @@ async function main() {
   (symRes.symbol || []).forEach(s => { symbolIdMap[s.symbolName] = s.symbolId; });
   console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
 
-  // Keep alive using correct method
+  // Log XAUUSD-F details specifically
+  const xauF = (symRes.symbol || []).find(s => s.symbolName === "XAUUSD-F");
+  console.log("XAUUSD-F details:", JSON.stringify(xauF));
+
   setInterval(() => connection.sendHeartbeat(), 25000);
 
   console.log("=== ENGINE READY — polling queue ===");
@@ -160,7 +165,6 @@ async function main() {
 
           console.log(`Sending order: ${ctSymbol} | symbolId=${symbolId} | side=${signal.action === "LONG" ? "BUY" : "SELL"} | volume=${volume} | stopLoss=${stopLoss}`);
 
-          // Fire and forget — execution result comes via ProtoOAExecutionEvent listener
           connection.sendCommand("ProtoOANewOrderReq", {
             ctidTraderAccountId: ACCOUNT_ID,
             symbolId,
@@ -169,13 +173,12 @@ async function main() {
             volume,
             relativeStopLoss: stopLoss,
             comment:          `HAWK|${signal.strategy_id}|${signal.signal_id}`,
-          }).then(result => {
-            console.log("Order command acknowledged:", JSON.stringify(result));
-          }).catch(err => {
-            console.error("Order command error:", err.message);
+          }).then(r => {
+            console.log("Order acknowledged:", JSON.stringify(r));
+          }).catch(e => {
+            console.error("Order rejected:", e.message, JSON.stringify(e));
           });
 
-          // Log immediately — execution event will confirm actual fill
           await logSignal(signal, { sent: true, symbolId, volume, stopLoss }, "EXECUTED");
 
         } else {
