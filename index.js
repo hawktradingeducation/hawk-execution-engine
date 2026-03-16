@@ -83,6 +83,10 @@ async function main() {
     console.log("RAW cTrader message:", JSON.stringify(message));
   });
 
+connection.on("ProtoOAExecutionEvent", (event) => {
+  console.log("EXECUTION EVENT:", JSON.stringify(event));
+});
+  
   console.log("Sending ProtoOAApplicationAuthReq...");
   await connection.sendCommand("ProtoOAApplicationAuthReq", {
     clientId: CLIENT_ID,
