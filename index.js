@@ -71,11 +71,24 @@ const SYMBOL_MAP = {
 
 // ── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(`╔════════════════════════════════════════╗`);
-  console.log(`║ Hawk Execution Engine v1.2 STARTED     ║`);
-  console.log(`║ Mode: ${IS_PAPER ? "PAPER (safe to test)    " : "LIVE  (real money!)    "}    ║`);
-  console.log(`║ ${new Date().toISOString()}  ║`);
-  console.log(`╚════════════════════════════════════════╝`);
+  // Get fresh access token first
+  console.log("Fetching fresh access token...");
+  const tokenRes = await fetch("https://connect.spotware.com/apps/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type:    "refresh_token",
+      refresh_token: process.env.CTRADER_REFRESH_TOKEN,
+      client_id:     CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }).toString()
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenData.access_token) {
+    throw new Error("Token fetch failed: " + JSON.stringify(tokenData));
+  }
+  const accessToken = tokenData.access_token;
+  console.log("Access token obtained");
 
   // Open WebSocket connection to cTrader
   const connection = new CTraderConnection({ host: HOST, port: PORT });
