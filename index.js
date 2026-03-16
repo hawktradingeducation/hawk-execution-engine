@@ -64,7 +64,7 @@ async function logSignal(signal, result, status, errorMsg = null) {
 }
 
 const SYMBOL_MAP = {
-  "XAUUSD": "XAUUSD",
+  "XAUUSD": "XAUUSD-F",
   "BTCUSD": "BTCUSD",
   "NAS100": "NAS100",
   "USOIL":  "XTIUSD",
