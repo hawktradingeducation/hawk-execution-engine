@@ -1,14 +1,10 @@
-// Hawk Execution Engine v1.4 — raw WebSocket, verbose logging
-const WebSocket = require("ws");
+// Hawk Execution Engine v1.5 — ctrader-layer with correct Protobuf messaging
+"use strict";
+
+const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient } = require("@supabase/supabase-js");
 
-console.log("=== ENGINE STARTING ===");
-console.log("Node version:", process.version);
-console.log("IS_PAPER:", process.env.IS_PAPER);
-console.log("ACCOUNT_ID:", process.env.CTRADER_ACCOUNT_ID);
-console.log("Has ACCESS_TOKEN:", !!process.env.CTRADER_ACCESS_TOKEN);
-console.log("Has CLIENT_ID:", !!process.env.CTRADER_CLIENT_ID);
-console.log("Has UPSTASH_URL:", !!process.env.UPSTASH_REDIS_REST_URL);
+console.log("=== HAWK ENGINE v1.5 STARTING ===");
 
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -21,16 +17,11 @@ const ACCESS_TOKEN  = process.env.CTRADER_ACCESS_TOKEN;
 const IS_PAPER      = process.env.IS_PAPER === "true";
 const HOST          = IS_PAPER ? "demo.ctraderapi.com" : "live.ctraderapi.com";
 
+console.log("IS_PAPER:", IS_PAPER);
+console.log("HOST:", HOST);
+console.log("ACCOUNT_ID:", ACCOUNT_ID);
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
-// Message ID counter
-let msgId = 1;
-
-// Pending responses map
-const pending = new Map();
-
-// Symbol cache
-let symbolMap = {};
 
 function getVolume(score) {
   if (score >= 9) return 300;
@@ -66,99 +57,63 @@ async function logSignal(signal, result, status, errorMsg = null) {
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER
     });
+    console.log("Logged to Supabase:", status);
   } catch(e) {
-    console.error("Supabase log error:", e.message);
+    console.error("Supabase error:", e.message);
   }
 }
 
-function connectCTrader() {
-  return new Promise((resolve, reject) => {
-    console.log(`Connecting to ${HOST}:5035...`);
-    const ws = new WebSocket(`wss://${HOST}:5035`);
-
-    ws.on("open", () => {
-      console.log("WebSocket connected");
-      resolve(ws);
-    });
-
-    ws.on("error", (err) => {
-      console.error("WebSocket error:", err.message);
-      reject(err);
-    });
-
-    ws.on("close", (code, reason) => {
-      console.error("WebSocket closed:", code, reason.toString());
-      process.exit(1); // Railway will restart
-    });
-
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data);
-        const id = msg.clientMsgId;
-        if (id && pending.has(id)) {
-          const { resolve, reject } = pending.get(id);
-          pending.delete(id);
-          if (msg.errorCode) {
-            reject(new Error(`${msg.errorCode}: ${msg.description}`));
-          } else {
-            resolve(msg.payload || msg);
-          }
-        }
-      } catch(e) {
-        console.error("Message parse error:", e.message);
-      }
-    });
-  });
-}
-
-function sendCommand(ws, payloadType, payload) {
-  return new Promise((resolve, reject) => {
-    const id = String(msgId++);
-    pending.set(id, { resolve, reject });
-    const msg = JSON.stringify({ clientMsgId: id, payloadType, payload });
-    ws.send(msg);
-    setTimeout(() => {
-      if (pending.has(id)) {
-        pending.delete(id);
-        reject(new Error("Timeout waiting for response to " + payloadType));
-      }
-    }, 10000);
-  });
-}
+const SYMBOL_MAP = {
+  "XAUUSD": "XAUUSD",
+  "BTCUSD": "BTCUSD",
+  "NAS100": "NAS100",
+  "USOIL":  "XTIUSD",
+};
 
 async function main() {
-  console.log("Connecting to cTrader WebSocket...");
-  const ws = await connectCTrader();
+  console.log("Opening cTrader connection...");
+  
+  const connection = new CTraderConnection({ host: HOST, port: 5035 });
+  
+  await connection.open();
+  console.log("Connection opened");
 
-  console.log("Authenticating application...");
-  await sendCommand(ws, "ProtoOAApplicationAuthReq", {
+  console.log("Sending ProtoOAApplicationAuthReq...");
+  await connection.sendCommand("ProtoOAApplicationAuthReq", {
     clientId: CLIENT_ID,
-    clientSecret: CLIENT_SECRET
+    clientSecret: CLIENT_SECRET,
   });
-  console.log("Application authenticated");
+  console.log("Application authenticated successfully");
 
-  console.log("Authenticating account...");
-  await sendCommand(ws, "ProtoOAAccountAuthReq", {
+  console.log("Sending ProtoOAAccountAuthReq...");
+  await connection.sendCommand("ProtoOAAccountAuthReq", {
     ctidTraderAccountId: ACCOUNT_ID,
-    accessToken: ACCESS_TOKEN
+    accessToken: ACCESS_TOKEN,
   });
   console.log("Account authenticated:", ACCOUNT_ID);
 
-  console.log("Loading symbols...");
-  const symRes = await sendCommand(ws, "ProtoOASymbolsListReq", {
+  console.log("Loading symbol list...");
+  const symRes = await connection.sendCommand("ProtoOASymbolsListReq", {
     ctidTraderAccountId: ACCOUNT_ID,
-    includeArchivedSymbols: false
+    includeArchivedSymbols: false,
   });
-  const symbols = symRes.symbol || [];
-  symbols.forEach(s => { symbolMap[s.symbolName] = s.symbolId; });
-  console.log("Symbols loaded:", Object.keys(symbolMap).length);
+  
+  const symbolIdMap = {};
+  (symRes.symbol || []).forEach(s => {
+    symbolIdMap[s.symbolName] = s.symbolId;
+  });
+  console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
 
-  console.log("=== ENGINE READY — Polling queue ===");
-
-  // Keep WebSocket alive with heartbeat every 25 seconds
-  setInterval(() => {
-    ws.send(JSON.stringify({ payloadType: "ProtoHeartbeatEvent", payload: {} }));
+  // Send heartbeat every 25 seconds to keep connection alive
+  setInterval(async () => {
+    try {
+      await connection.sendCommand("ProtoHeartbeatEvent", {});
+    } catch(e) {
+      console.error("Heartbeat error:", e.message);
+    }
   }, 25000);
+
+  console.log("=== ENGINE READY — polling queue ===");
 
   while (true) {
     try {
@@ -179,41 +134,44 @@ async function main() {
       const raw = Array.isArray(data.result) ? data.result[1] : data.result;
       const signal = typeof raw === "string" ? JSON.parse(raw) : raw;
 
-      console.log(`Signal: ${signal.strategy_id} | ${signal.action} | Score:${signal.score}`);
+      console.log(`Signal: ${signal.strategy_id} | ${signal.action} | Score: ${signal.score} | ID: ${signal.signal_id}`);
 
       if (isDuplicate(signal.signal_id)) {
+        console.warn("Duplicate signal — ignoring");
         await logSignal(signal, null, "DUPLICATE");
         continue;
       }
 
       const isEntry = signal.action === "LONG" || signal.action === "SHORT";
       const isLong  = signal.action === "LONG" || signal.action === "LONG_EXIT" || signal.action === "LONG_STOP";
-      const SYMBOL_MAP = { "XAUUSD":"XAUUSD", "BTCUSD":"BTCUSD", "NAS100":"NAS100", "USOIL":"XTIUSD" };
+      const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
+      const symbolId = symbolIdMap[ctSymbol];
+
+      if (!symbolId) {
+        console.error("Symbol not found:", ctSymbol);
+        await logSignal(signal, null, "ERROR", "Symbol not found: " + ctSymbol);
+        continue;
+      }
 
       try {
-        const ctSymbol  = SYMBOL_MAP[signal.ticker] || signal.ticker;
-        const symbolId  = symbolMap[ctSymbol];
-        if (!symbolId) throw new Error("Symbol not found: " + ctSymbol);
-
         let result;
         if (isEntry) {
-          const atr      = parseFloat(signal.atr);
-          const stopLoss = Math.round(atr * 2 * 100);
-          result = await sendCommand(ws, "ProtoOANewOrderReq", {
+          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100);
+          result = await connection.sendCommand("ProtoOANewOrderReq", {
             ctidTraderAccountId: ACCOUNT_ID,
             symbolId,
             orderType:        "MARKET",
             tradeSide:        signal.action === "LONG" ? "BUY" : "SELL",
             volume:           getVolume(parseInt(signal.score)),
             relativeStopLoss: stopLoss,
-            comment:          `HAWK|${signal.strategy_id}|${signal.signal_id}`
+            comment:          `HAWK|${signal.strategy_id}|${signal.signal_id}`,
           });
-          console.log("Order placed:", JSON.stringify(result));
+          console.log("Order placed");
           await logSignal(signal, result, "EXECUTED");
 
         } else {
-          const posRes = await sendCommand(ws, "ProtoOAReconcileReq", {
-            ctidTraderAccountId: ACCOUNT_ID
+          const posRes = await connection.sendCommand("ProtoOAReconcileReq", {
+            ctidTraderAccountId: ACCOUNT_ID,
           });
           const position = (posRes.position || []).find(p =>
             p.tradeData?.symbolId === symbolId &&
@@ -223,10 +181,10 @@ async function main() {
             console.warn("No matching position");
             await logSignal(signal, null, "NO_POSITION");
           } else {
-            result = await sendCommand(ws, "ProtoOAClosePositionReq", {
+            result = await connection.sendCommand("ProtoOAClosePositionReq", {
               ctidTraderAccountId: ACCOUNT_ID,
               positionId:          position.positionId,
-              volume:              position.tradeData.volume
+              volume:              position.tradeData.volume,
             });
             console.log("Position closed");
             await logSignal(signal, result, "CLOSED");
@@ -238,7 +196,7 @@ async function main() {
       }
 
     } catch(err) {
-      console.error("Queue error:", err.message);
+      console.error("Queue poll error:", err.message);
       await new Promise(r => setTimeout(r, 3000));
     }
   }
