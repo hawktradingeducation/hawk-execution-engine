@@ -86,11 +86,21 @@ async function main() {
   console.log("Application authenticated successfully");
 
   console.log("Sending ProtoOAAccountAuthReq...");
-  await connection.sendCommand("ProtoOAAccountAuthReq", {
-    ctidTraderAccountId: ACCOUNT_ID,
-    accessToken: ACCESS_TOKEN,
-  });
-  console.log("Account authenticated:", ACCOUNT_ID);
+let accountAuthResult;
+  try {
+    accountAuthResult = await connection.sendCommand("ProtoOAAccountAuthReq", {
+      ctidTraderAccountId: ACCOUNT_ID,
+      accessToken: ACCESS_TOKEN,
+    });
+    console.log("Account authenticated:", ACCOUNT_ID);
+    console.log("Account auth result:", JSON.stringify(accountAuthResult));
+  } catch(authErr) {
+    console.error("Account auth failed - full error:", JSON.stringify(authErr));
+    console.error("Error message:", authErr?.message);
+    console.error("Error code:", authErr?.errorCode);
+    console.error("Error description:", authErr?.description);
+    throw authErr;
+  }
 
   console.log("Loading symbol list...");
   const symRes = await connection.sendCommand("ProtoOASymbolsListReq", {
