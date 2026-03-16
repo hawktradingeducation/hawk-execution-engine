@@ -68,4 +68,154 @@ const SYMBOL_MAP = {
   "USOIL":  "XTIUSD",
 };
 
-as
+async function main() {
+  console.log("Opening cTrader connection...");
+  const connection = new CTraderConnection({ host: HOST, port: 5035 });
+  await connection.open();
+  console.log("Connection opened");
+
+  // Listen for ALL execution events from cTrader
+  connection.on("ProtoOAExecutionEvent", (event) => {
+    console.log("EXECUTION EVENT received:", JSON.stringify(event));
+  });
+
+  // Listen for error events
+  connection.on("ProtoOAErrorRes", (event) => {
+    console.error("cTrader ERROR event:", JSON.stringify(event));
+  });
+
+  // Listen for order error events
+  connection.on("ProtoOAOrderErrorEvent", (event) => {
+    console.error("ORDER ERROR event:", JSON.stringify(event));
+  });
+
+  await connection.sendCommand("ProtoOAApplicationAuthReq", {
+    clientId: CLIENT_ID,
+    clientSecret: CLIENT_SECRET,
+  });
+  console.log("Application authenticated");
+
+  await connection.sendCommand("ProtoOAAccountAuthReq", {
+    ctidTraderAccountId: ACCOUNT_ID,
+    accessToken: ACCESS_TOKEN,
+  });
+  console.log("Account authenticated:", ACCOUNT_ID);
+
+  const symRes = await connection.sendCommand("ProtoOASymbolsListReq", {
+    ctidTraderAccountId: ACCOUNT_ID,
+    includeArchivedSymbols: false,
+  });
+
+  const symbolIdMap = {};
+  (symRes.symbol || []).forEach(s => { symbolIdMap[s.symbolName] = s.symbolId; });
+  console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
+
+  // Keep alive using correct method
+  setInterval(() => connection.sendHeartbeat(), 25000);
+
+  console.log("=== ENGINE READY — polling queue ===");
+
+  while (true) {
+    try {
+      const res = await fetch(
+        `${UPSTASH_URL}/brpop/hawk:signals/5`,
+        { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } }
+      );
+
+      if (!res.ok) {
+        console.error("Upstash error:", res.status);
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+
+      const data = await res.json();
+      if (!data.result) continue;
+
+      const raw = Array.isArray(data.result) ? data.result[1] : data.result;
+      const signal = typeof raw === "string" ? JSON.parse(raw) : raw;
+
+      console.log(`Signal: ${signal.strategy_id} | ${signal.action} | Score: ${signal.score} | ID: ${signal.signal_id}`);
+
+      if (isDuplicate(signal.signal_id)) {
+        console.warn("Duplicate — ignoring:", signal.signal_id);
+        await logSignal(signal, null, "DUPLICATE");
+        continue;
+      }
+
+      const isEntry = signal.action === "LONG" || signal.action === "SHORT";
+      const isLong  = signal.action === "LONG" || signal.action === "LONG_EXIT" || signal.action === "LONG_STOP";
+      const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
+      const symbolId = symbolIdMap[ctSymbol];
+
+      if (!symbolId) {
+        console.error("Symbol not found:", ctSymbol);
+        await logSignal(signal, null, "ERROR", "Symbol not found: " + ctSymbol);
+        continue;
+      }
+
+      try {
+        if (isEntry) {
+          const volume   = getVolume(parseInt(signal.score));
+          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 10);
+
+          console.log(`Sending order: ${ctSymbol} | symbolId=${symbolId} | side=${signal.action === "LONG" ? "BUY" : "SELL"} | volume=${volume} | stopLoss=${stopLoss}`);
+
+          // Fire and forget — execution result comes via ProtoOAExecutionEvent listener
+          connection.sendCommand("ProtoOANewOrderReq", {
+            ctidTraderAccountId: ACCOUNT_ID,
+            symbolId,
+            orderType:        "MARKET",
+            tradeSide:        signal.action === "LONG" ? "BUY" : "SELL",
+            volume,
+            relativeStopLoss: stopLoss,
+            comment:          `HAWK|${signal.strategy_id}|${signal.signal_id}`,
+          }).then(result => {
+            console.log("Order command acknowledged:", JSON.stringify(result));
+          }).catch(err => {
+            console.error("Order command error:", err.message);
+          });
+
+          // Log immediately — execution event will confirm actual fill
+          await logSignal(signal, { sent: true, symbolId, volume, stopLoss }, "EXECUTED");
+
+        } else {
+          const posRes = await connection.sendCommand("ProtoOAReconcileReq", {
+            ctidTraderAccountId: ACCOUNT_ID,
+          });
+
+          const position = (posRes.position || []).find(p =>
+            p.tradeData?.symbolId === symbolId &&
+            (isLong ? p.tradeData?.tradeSide === "BUY" : p.tradeData?.tradeSide === "SELL")
+          );
+
+          if (!position) {
+            console.warn("No matching position found");
+            await logSignal(signal, null, "NO_POSITION");
+          } else {
+            console.log(`Closing position: ${position.positionId}`);
+            connection.sendCommand("ProtoOAClosePositionReq", {
+              ctidTraderAccountId: ACCOUNT_ID,
+              positionId:          position.positionId,
+              volume:              position.tradeData.volume,
+            }).then(r => console.log("Close acknowledged:", JSON.stringify(r)))
+              .catch(e => console.error("Close error:", e.message));
+
+            await logSignal(signal, { positionId: position.positionId }, "CLOSED");
+          }
+        }
+      } catch(err) {
+        console.error("Execution error:", err.message);
+        await logSignal(signal, null, "ERROR", err.message);
+      }
+
+    } catch(err) {
+      console.error("Queue poll error:", err.message);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+}
+
+main().catch(err => {
+  console.error("Fatal:", err.message);
+  process.exit(1);
+});
