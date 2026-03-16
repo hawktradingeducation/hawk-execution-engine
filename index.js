@@ -1,10 +1,10 @@
-// Hawk Execution Engine — index.js v1.8
+// Hawk Execution Engine — index.js v1.9
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient } = require("@supabase/supabase-js");
 
-console.log("=== HAWK ENGINE v1.8 STARTING ===");
+console.log("=== HAWK ENGINE v1.9 STARTING ===");
 
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -21,13 +21,11 @@ console.log("IS_PAPER:", IS_PAPER, "| HOST:", HOST, "| ACCOUNT_ID:", ACCOUNT_ID)
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// cTrader volume units for XAUUSD on Pepperstone:
-// 1 unit = 0.01 lots. Sending 100 = 1 lot, 10 = 0.10 lots, 1 = 0.01 lots
-// Testing with 100 (= 0.01 lots in cTrader cents convention)
+// Volume in cTrader cents: 1000 = 0.01 lots, 2000 = 0.02 lots, 3000 = 0.03 lots
 function getVolume(score) {
-  if (score >= 9) return 300;  // 0.03 lots
-  if (score >= 8) return 200;  // 0.02 lots
-  return 100;                   // 0.01 lots
+  if (score >= 9) return 3000;
+  if (score >= 8) return 2000;
+  return 1000;
 }
 
 const seenSignals = new Map();
@@ -77,7 +75,6 @@ async function main() {
   await connection.open();
   console.log("Connection opened");
 
-  // Listen for execution and error events
   connection.on("ProtoOAExecutionEvent", (e) => {
     console.log("EXECUTION EVENT:", JSON.stringify(e));
   });
@@ -87,9 +84,6 @@ async function main() {
   connection.on("ProtoOAErrorRes", (e) => {
     console.error("ERROR RES EVENT:", JSON.stringify(e));
   });
-  // Numeric payload type fallbacks
-  connection.on("2132", (e) => console.error("ORDER ERROR (2132):", JSON.stringify(e)));
-  connection.on("2126", (e) => console.log("EXECUTION (2126):", JSON.stringify(e)));
 
   await connection.sendCommand("ProtoOAApplicationAuthReq", {
     clientId: CLIENT_ID,
@@ -112,9 +106,9 @@ async function main() {
   (symRes.symbol || []).forEach(s => { symbolIdMap[s.symbolName] = s.symbolId; });
   console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
 
-  // Log XAUUSD-F details specifically
-  const xauF = (symRes.symbol || []).find(s => s.symbolName === "XAUUSD-F");
-  console.log("XAUUSD-F details:", JSON.stringify(xauF));
+  // Log XAUUSD details
+  const xau = (symRes.symbol || []).find(s => s.symbolName === "XAUUSD");
+  console.log("XAUUSD details:", JSON.stringify(xau));
 
   setInterval(() => connection.sendHeartbeat(), 25000);
 
@@ -161,7 +155,9 @@ async function main() {
       try {
         if (isEntry) {
           const volume   = getVolume(parseInt(signal.score));
-          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 10);
+          // relativeStopLoss in 1/100000 of price unit
+          // ATR 5.5 * 2 * 100000 = 1,100,000 = 11 point stop
+          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100000);
 
           console.log(`Sending order: ${ctSymbol} | symbolId=${symbolId} | side=${signal.action === "LONG" ? "BUY" : "SELL"} | volume=${volume} | stopLoss=${stopLoss}`);
 
