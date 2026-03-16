@@ -1,10 +1,10 @@
-// Hawk Execution Engine v1.5 — ctrader-layer with correct Protobuf messaging
+// Hawk Execution Engine — index.js v1.6 — Full debug logging
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient } = require("@supabase/supabase-js");
 
-console.log("=== HAWK ENGINE v1.5 STARTING ===");
+console.log("=== HAWK ENGINE v1.6 STARTING ===");
 
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -24,9 +24,9 @@ console.log("ACCOUNT_ID:", ACCOUNT_ID);
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 function getVolume(score) {
-  if (score >= 9) return 300;
-  if (score >= 8) return 200;
-  return 100;
+  if (score >= 9) return 3;
+  if (score >= 8) return 2;
+  return 1;
 }
 
 const seenSignals = new Map();
@@ -72,11 +72,16 @@ const SYMBOL_MAP = {
 
 async function main() {
   console.log("Opening cTrader connection...");
-  
+
   const connection = new CTraderConnection({ host: HOST, port: 5035 });
-  
+
   await connection.open();
   console.log("Connection opened");
+
+  // RAW MESSAGE LISTENER — logs everything cTrader sends back
+  connection.on("message", (message) => {
+    console.log("RAW cTrader message:", JSON.stringify(message));
+  });
 
   console.log("Sending ProtoOAApplicationAuthReq...");
   await connection.sendCommand("ProtoOAApplicationAuthReq", {
@@ -86,35 +91,33 @@ async function main() {
   console.log("Application authenticated successfully");
 
   console.log("Sending ProtoOAAccountAuthReq...");
-let accountAuthResult;
-  try {
-    accountAuthResult = await connection.sendCommand("ProtoOAAccountAuthReq", {
-      ctidTraderAccountId: ACCOUNT_ID,
-      accessToken: ACCESS_TOKEN,
-    });
-    console.log("Account authenticated:", ACCOUNT_ID);
-    console.log("Account auth result:", JSON.stringify(accountAuthResult));
-  } catch(authErr) {
-    console.error("Account auth failed - full error:", JSON.stringify(authErr));
-    console.error("Error message:", authErr?.message);
-    console.error("Error code:", authErr?.errorCode);
-    console.error("Error description:", authErr?.description);
-    throw authErr;
-  }
+  await connection.sendCommand("ProtoOAAccountAuthReq", {
+    ctidTraderAccountId: ACCOUNT_ID,
+    accessToken: ACCESS_TOKEN,
+  });
+  console.log("Account authenticated:", ACCOUNT_ID);
 
   console.log("Loading symbol list...");
   const symRes = await connection.sendCommand("ProtoOASymbolsListReq", {
     ctidTraderAccountId: ACCOUNT_ID,
     includeArchivedSymbols: false,
   });
-  
+
   const symbolIdMap = {};
   (symRes.symbol || []).forEach(s => {
     symbolIdMap[s.symbolName] = s.symbolId;
   });
   console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
 
-  // Send heartbeat every 25 seconds to keep connection alive
+  // Log all gold-related symbols
+  const goldSymbols = (symRes.symbol || []).filter(s =>
+    s.symbolName.includes("XAU") || s.symbolName.toLowerCase().includes("gold")
+  );
+  console.log("Gold symbols found:", JSON.stringify(goldSymbols.map(s => ({
+    name: s.symbolName, id: s.symbolId
+  }))));
+
+  // Keep connection alive
   setInterval(async () => {
     try {
       await connection.sendCommand("ProtoHeartbeatEvent", {});
@@ -157,8 +160,11 @@ let accountAuthResult;
       const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
       const symbolId = symbolIdMap[ctSymbol];
 
+      console.log(`Symbol lookup: ${signal.ticker} -> ${ctSymbol} -> symbolId: ${symbolId}`);
+
       if (!symbolId) {
-        console.error("Symbol not found:", ctSymbol);
+        console.error("Symbol not found in map:", ctSymbol);
+        console.error("Available symbols containing XAU:", Object.keys(symbolIdMap).filter(k => k.includes("XAU")));
         await logSignal(signal, null, "ERROR", "Symbol not found: " + ctSymbol);
         continue;
       }
@@ -166,27 +172,34 @@ let accountAuthResult;
       try {
         let result;
         if (isEntry) {
+          const volume   = getVolume(parseInt(signal.score));
           const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 10);
+
+          console.log(`Placing order: symbolId=${symbolId} side=${signal.action === "LONG" ? "BUY" : "SELL"} volume=${volume} stopLoss=${stopLoss}`);
+
           result = await connection.sendCommand("ProtoOANewOrderReq", {
             ctidTraderAccountId: ACCOUNT_ID,
             symbolId,
             orderType:        "MARKET",
             tradeSide:        signal.action === "LONG" ? "BUY" : "SELL",
-            volume:           getVolume(parseInt(signal.score)),
+            volume,
             relativeStopLoss: stopLoss,
             comment:          `HAWK|${signal.strategy_id}|${signal.signal_id}`,
           });
-          console.log("Order placed");
+          console.log("Order response:", JSON.stringify(result));
           await logSignal(signal, result, "EXECUTED");
 
         } else {
           const posRes = await connection.sendCommand("ProtoOAReconcileReq", {
             ctidTraderAccountId: ACCOUNT_ID,
           });
+          console.log("Positions:", JSON.stringify(posRes));
+
           const position = (posRes.position || []).find(p =>
             p.tradeData?.symbolId === symbolId &&
             (isLong ? p.tradeData?.tradeSide === "BUY" : p.tradeData?.tradeSide === "SELL")
           );
+
           if (!position) {
             console.warn("No matching position");
             await logSignal(signal, null, "NO_POSITION");
@@ -196,12 +209,13 @@ let accountAuthResult;
               positionId:          position.positionId,
               volume:              position.tradeData.volume,
             });
-            console.log("Position closed");
+            console.log("Close response:", JSON.stringify(result));
             await logSignal(signal, result, "CLOSED");
           }
         }
       } catch(err) {
         console.error("Execution error:", err.message);
+        console.error("Execution error full:", JSON.stringify(err));
         await logSignal(signal, null, "ERROR", err.message);
       }
 
