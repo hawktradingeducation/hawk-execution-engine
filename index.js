@@ -12,7 +12,6 @@ const SUPABASE_KEY       = process.env.SUPABASE_SERVICE_KEY;
 const CLIENT_ID          = process.env.CTRADER_CLIENT_ID;
 const CLIENT_SECRET      = process.env.CTRADER_CLIENT_SECRET;
 const ACCOUNT_ID         = process.env.CTRADER_ACCOUNT_ID;
-const ACCESS_TOKEN       = process.env.CTRADER_REFRESH_TOKEN; // we use refresh token as access token here
 const IS_PAPER           = process.env.IS_PAPER === "true";
 
 const HOST = IS_PAPER ? "demo.ctraderapi.com" : "live.ctraderapi.com";
@@ -105,7 +104,7 @@ async function main() {
   // Step 2: Authenticate the trading account
   await connection.sendCommand("ProtoOAAccountAuthReq", {
     ctidTraderAccountId: parseInt(ACCOUNT_ID),
-    accessToken: ACCESS_TOKEN,
+    accessToken: accessToken,
   });
   console.log(`Account ${ACCOUNT_ID} authenticated`);
 
