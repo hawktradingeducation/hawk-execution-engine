@@ -166,7 +166,7 @@ let accountAuthResult;
       try {
         let result;
         if (isEntry) {
-          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100);
+          const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 10);
           result = await connection.sendCommand("ProtoOANewOrderReq", {
             ctidTraderAccountId: ACCOUNT_ID,
             symbolId,
