@@ -191,33 +191,30 @@ async function connectToCTrader() {
         console.log(`Execution confirmed | type:${execType} | orderId:${orderId} | price:${fillPrice} | vol:${filledVol}`);
 
         if (orderId || positionId) {
-          const query = orderId
-            ? supabase.from('signal_log')
-                .update({
-                  fill_price:    fillPrice,
-                  filled_volume: filledVol,
-                  order_id:      orderId,
-                  position_id:   positionId,
-                  exec_type:     execType,
-                })
-                .eq('status', 'EXECUTED')
-                .is('order_id', null)
-                .order('processed_at', { ascending: false })
-                .limit(1)
-            : supabase.from('signal_log')
-                .update({
-                  fill_price:    fillPrice,
-                  filled_volume: filledVol,
-                  position_id:   positionId,
-                  exec_type:     execType,
-                })
-                .eq('status', 'EXECUTED')
-                .is('position_id', null)
-                .order('processed_at', { ascending: false })
-                .limit(1);
+          // Fetch the most recent unconfirmed EXECUTED row
+          const { data: rows } = await supabase
+            .from('signal_log')
+            .select('id')
+            .eq('status', 'EXECUTED')
+            .is('order_id', null)
+            .order('processed_at', { ascending: false })
+            .limit(1);
 
-          const { error } = await query;
-          if (error) console.error('Execution update error:', error.message);
+          if (rows && rows.length > 0) {
+            const { error } = await supabase
+              .from('signal_log')
+              .update({
+                fill_price:    fillPrice,
+                filled_volume: filledVol,
+                order_id:      orderId,
+                position_id:   positionId,
+                exec_type:     execType,
+              })
+              .eq('id', rows[0].id);
+
+            if (error) console.error('Execution update error:', error.message);
+            else console.log('Execution detail logged | id:', rows[0].id);
+          }
         }
       } catch(err) {
         console.error('Execution event error:', err.message);
