@@ -173,7 +173,7 @@ async function connectToCTrader() {
     connection = new CTraderConnection({ host: HOST, port: 5035 });
 
     // TEMPORARY DIAGNOSTIC
-    connection.on('ProtoOAExecutionEvent', (...args) => console.log('DIAG A keys:', Object.keys(args[0]), 'proto:', Object.getOwnPropertyNames(Object.getPrototypeOf(args[0]))));
+    connection.on('ProtoOAExecutionEvent', (...args) => console.log('DIAG A:', args[0].toObject ? JSON.stringify(args[0].toObject()).substring(0, 500) : 'no toObject method'));
     connection.on('execution', (e) => console.log('DIAG B:', JSON.stringify(e).substring(0, 300)));
     connection.on('ProtoOAOrderErrorEvent', (e) => console.log('DIAG ERR:', JSON.stringify(e).substring(0, 300)));
     
