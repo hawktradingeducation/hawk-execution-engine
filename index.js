@@ -6,7 +6,7 @@ const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.0 STARTING ===");
+process.exit(0); // TEMP HOLD
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
 const UPSTASH_URL    = process.env.UPSTASH_REDIS_REST_URL;
