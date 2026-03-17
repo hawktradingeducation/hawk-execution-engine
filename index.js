@@ -173,7 +173,7 @@ async function connectToCTrader() {
     connection = new CTraderConnection({ host: HOST, port: 5035 });
 
     // TEMPORARY DIAGNOSTIC
-    connection.on('ProtoOAExecutionEvent', (...args) => console.log('DIAG A:', JSON.stringify(args).substring(0, 500)));
+    connection.on('ProtoOAExecutionEvent', (...args) => console.log('DIAG A: type=', args[0].executionType, 'order=', args[0].order?.orderId, 'deal=', args[0].deal?.executionPrice));
     connection.on('execution', (e) => console.log('DIAG B:', JSON.stringify(e).substring(0, 300)));
     connection.on('ProtoOAOrderErrorEvent', (e) => console.log('DIAG ERR:', JSON.stringify(e).substring(0, 300)));
     
