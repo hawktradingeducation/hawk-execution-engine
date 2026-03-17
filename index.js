@@ -1,26 +1,26 @@
-// Hawk Execution Engine — index.js v2.0
-// Resilient FAF Pipeline — Direct HTTP + Auto-reconnect + Token refresh
+// Hawk Execution Engine — index.js v2.1
+// Resilient FAF Pipeline — Direct HTTP + Auto-reconnect + Token refresh + Full observability
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.0 STARTING ===");
+console.log("=== HAWK ENGINE v2.1 STARTING ===");
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
-const UPSTASH_URL    = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN  = process.env.UPSTASH_REDIS_REST_TOKEN;
-const SUPABASE_URL   = process.env.SUPABASE_URL;
-const SUPABASE_KEY   = process.env.SUPABASE_SERVICE_KEY;
-const CLIENT_ID      = process.env.CTRADER_CLIENT_ID;
-const CLIENT_SECRET  = process.env.CTRADER_CLIENT_SECRET;
-const REFRESH_TOKEN  = process.env.CTRADER_REFRESH_TOKEN;
-const ACCOUNT_ID     = parseInt(process.env.CTRADER_ACCOUNT_ID);
-const IS_PAPER       = process.env.IS_PAPER === 'true';
+const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
+const SUPABASE_URL    = process.env.SUPABASE_URL;
+const SUPABASE_KEY    = process.env.SUPABASE_SERVICE_KEY;
+const CLIENT_ID       = process.env.CTRADER_CLIENT_ID;
+const CLIENT_SECRET   = process.env.CTRADER_CLIENT_SECRET;
+const REFRESH_TOKEN   = process.env.CTRADER_REFRESH_TOKEN;
+const ACCOUNT_ID      = parseInt(process.env.CTRADER_ACCOUNT_ID);
+const IS_PAPER        = process.env.IS_PAPER === 'true';
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
-const PORT           = parseInt(process.env.PORT) || 3000;
-const HOST           = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
+const PORT            = parseInt(process.env.PORT) || 3000;
+const HOST            = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
 
 console.log("IS_PAPER:", IS_PAPER, "| HOST:", HOST, "| ACCOUNT_ID:", ACCOUNT_ID);
 
@@ -55,6 +55,9 @@ async function refreshAccessToken() {
 }
 
 // ── VOLUME ────────────────────────────────────────────────────────────
+// Score 7 = 0.04 lots = 400 cents
+// Score 8 = 0.05 lots = 500 cents
+// Score 9 = 0.06 lots = 600 cents
 function getVolume(score) {
   if (score >= 9) return 600;
   if (score >= 8) return 500;
@@ -131,6 +134,21 @@ async function logAlert(alertType, severity, message) {
   } catch(e) { console.error('Supabase alerts error:', e.message); }
 }
 
+async function logError(signal, errorCode, errorDesc, rawEvent = null) {
+  try {
+    await supabase.from('recent_errors').insert({
+      error_time:  new Date().toISOString(),
+      signal_id:   signal ? signal.signal_id : null,
+      ticker:      signal ? signal.ticker : null,
+      action:      signal ? signal.action : null,
+      error_code:  errorCode,
+      error_desc:  errorDesc,
+      raw_event:   rawEvent,
+      is_paper:    IS_PAPER,
+    });
+  } catch(e) { console.error('Supabase recent_errors error:', e.message); }
+}
+
 // ── SYMBOL MAP ────────────────────────────────────────────────────────
 const SYMBOL_MAP = {
   "XAUUSD": "XAUUSD",
@@ -154,20 +172,75 @@ async function connectToCTrader() {
     console.log("Connecting to cTrader...");
     connection = new CTraderConnection({ host: HOST, port: 5035 });
 
-    connection.on('ProtoOAExecutionEvent', (e) => {
-      console.log("Execution event received");
+    // ── D3: Execution confirmation deserialisation ────────────────
+    connection.on('ProtoOAExecutionEvent', async (e) => {
+      try {
+        const execType  = e.executionType;
+        const order     = e.order    || {};
+        const position  = e.position || {};
+        const deal      = e.deal     || {};
+
+        if (!['ORDER_FILLED', 'ORDER_PARTIAL_FILL', 'POSITION_CLOSED',
+              'POSITION_PARTIAL_CLOSE'].includes(execType)) return;
+
+        const orderId    = order.orderId    || deal.dealId   || null;
+        const positionId = position.positionId               || null;
+        const fillPrice  = deal.executionPrice               || null;
+        const filledVol  = deal.filledVolume                 || null;
+
+        console.log(`Execution confirmed | type:${execType} | orderId:${orderId} | price:${fillPrice} | vol:${filledVol}`);
+
+        if (orderId || positionId) {
+          const query = orderId
+            ? supabase.from('signal_log')
+                .update({
+                  fill_price:    fillPrice,
+                  filled_volume: filledVol,
+                  order_id:      orderId,
+                  position_id:   positionId,
+                  exec_type:     execType,
+                })
+                .eq('status', 'EXECUTED')
+                .is('order_id', null)
+                .order('processed_at', { ascending: false })
+                .limit(1)
+            : supabase.from('signal_log')
+                .update({
+                  fill_price:    fillPrice,
+                  filled_volume: filledVol,
+                  position_id:   positionId,
+                  exec_type:     execType,
+                })
+                .eq('status', 'EXECUTED')
+                .is('position_id', null)
+                .order('processed_at', { ascending: false })
+                .limit(1);
+
+          const { error } = await query;
+          if (error) console.error('Execution update error:', error.message);
+        }
+      } catch(err) {
+        console.error('Execution event error:', err.message);
+      }
     });
-    connection.on('ProtoOAOrderErrorEvent', (e) => {
-      console.error("Order error:", JSON.stringify(e));
-      logAlert('ORDER_ERROR', 'CRITICAL', JSON.stringify(e));
+
+    // ── D6: Order rejection capture ───────────────────────────────
+    connection.on('ProtoOAOrderErrorEvent', async (e) => {
+      const code = e.errorCode    || 'UNKNOWN';
+      const desc = e.description  || '';
+      console.error(`Order rejected | code:${code} | ${desc}`);
+      await logError(null, code, desc, e);
+      await logAlert('ORDER_REJECTED', 'CRITICAL', `Order rejected: ${code} — ${desc}`);
     });
+
     connection.on('close', () => {
       console.warn("cTrader WebSocket closed — scheduling reconnect");
-      isConnected = false;
+      isConnected  = false;
       reconnecting = false;
       logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader connection closed. Reconnecting...');
       setTimeout(connectToCTrader, 3000);
     });
+
     connection.on('error', (err) => {
       console.error("cTrader WebSocket error:", err.message);
       isConnected = false;
@@ -200,7 +273,7 @@ async function connectToCTrader() {
     isConnected  = true;
     reconnecting = false;
     console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.0 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    await logAlert('ENGINE_READY', 'INFO', `Engine v2.1 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
   } catch(err) {
     console.error("cTrader connection failed:", err.message);
@@ -296,8 +369,9 @@ async function executeSignal(signal) {
         comment:          `HAWK|${signal.strategy_id}|S${signal.score}`,
       }).then(() => {
         console.log("Order sent successfully");
-      }).catch(e => {
-        console.error("Order error:", e.message);
+      }).catch(async (e) => {
+        console.error("Order send error:", e.message);
+        await logError(signal, 'SEND_ERROR', e.message, null);
       });
 
       await logSignal(signal, { symbolId, volume, stopLoss }, 'EXECUTED', null, latencyMs);
@@ -322,8 +396,9 @@ async function executeSignal(signal) {
         volume:              position.tradeData.volume,
       }).then(() => {
         console.log("Close sent successfully");
-      }).catch(e => {
-        console.error("Close error:", e.message);
+      }).catch(async (e) => {
+        console.error("Close send error:", e.message);
+        await logError(signal, 'CLOSE_ERROR', e.message, null);
       });
       await logSignal(signal, { positionId: position.positionId }, 'CLOSED', null, latencyMs);
     }
@@ -353,9 +428,10 @@ function startHttpServer() {
 
   app.get('/health', (req, res) => {
     res.json({
-      status: isConnected ? 'CONNECTED' : 'DISCONNECTED',
-      mode:   IS_PAPER ? 'PAPER' : 'LIVE',
-      uptime: process.uptime(),
+      status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
+      mode:    IS_PAPER ? 'PAPER' : 'LIVE',
+      uptime:  process.uptime(),
+      version: '2.1',
     });
   });
 
@@ -370,7 +446,7 @@ async function main() {
   await refreshAccessToken();
 
   // 2. Schedule token refresh every 20 days (safe within 32-bit integer limit)
-  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000; // 1,728,000,000ms — safe
+  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000; // 1,728,000,000ms
   setInterval(async () => {
     try { await refreshAccessToken(); }
     catch(e) { logAlert('TOKEN_REFRESH_FAILED', 'CRITICAL', e.message); }
