@@ -91,10 +91,55 @@ function isDuplicate(signalId) {
   return false;
 }
 
+// ── SAFE SERIALISE ────────────────────────────────────────────────────
+// Handles protobuf objects that may not be plain JSON-serialisable
+function safeSerialise(obj) {
+  try {
+    if (obj && typeof obj.toJSON === 'function') return obj.toJSON();
+    return JSON.parse(JSON.stringify(obj));
+  } catch(_) {
+    return { raw: String(obj) };
+  }
+}
+
+// ── EXECUTION TYPE NORMALISATION ──────────────────────────────────────
+// protobufjs may return enum values as integers rather than strings.
+// Map both forms so the handler is robust regardless of library behaviour.
+const EXEC_TYPE_MAP = {
+  2:  'ORDER_FILLED',
+  3:  'ORDER_PARTIAL_FILL',
+  4:  'ORDER_CANCELLED',
+  5:  'ORDER_EXPIRED',
+  6:  'ORDER_REJECTED',
+  7:  'ORDER_CANCEL_REJECTED',
+  51: 'SWAP',
+  52: 'DEPOSIT_WITHDRAW',
+  53: 'ORDER_PARTIAL_FILL_CANCEL',
+};
+
+function normaliseExecType(raw) {
+  if (typeof raw === 'string' && raw.length > 0) return raw;
+  if (typeof raw === 'number') return EXEC_TYPE_MAP[raw] || `UNKNOWN_TYPE_${raw}`;
+  return null;
+}
+
+const FILLED_TYPES   = new Set(['ORDER_FILLED', 'ORDER_PARTIAL_FILL']);
+const REJECTED_TYPES = new Set(['ORDER_REJECTED', 'ORDER_CANCEL_REJECTED']);
+
+// ── PENDING ORDER TRACKING ────────────────────────────────────────────
+// Single slot — one order in flight at a time is safe for 1-minute scalping.
+// Stores the Supabase row ID so the async execution event can update the
+// correct record without relying on fragile status-based queries.
+let pendingDbId     = null;
+let pendingTicker   = null;
+let execEventLogged = false; // Log full event structure once to confirm field paths
+
 // ── SUPABASE LOGGING ──────────────────────────────────────────────────
+
+// Returns the inserted row ID. Required for execution event confirmation.
 async function logSignal(signal, result, status, errorMsg = null, latencyMs = null) {
   try {
-    await supabase.from('signal_log').insert({
+    const { data, error } = await supabase.from('signal_log').insert({
       signal_id:     signal.signal_id,
       strategy_id:   signal.strategy_id,
       ticker:        signal.ticker,
@@ -109,9 +154,15 @@ async function logSignal(signal, result, status, errorMsg = null, latencyMs = nu
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER,
       latency_ms:    latencyMs,
-    });
-    console.log('Logged:', status, latencyMs ? `(${latencyMs}ms)` : '');
-  } catch(e) { console.error('Supabase signal_log error:', e.message); }
+    }).select('id').single();
+
+    if (error) throw error;
+    console.log('Logged:', status, latencyMs ? `(${latencyMs}ms)` : '', '| dbId:', data?.id);
+    return data?.id || null;
+  } catch(e) {
+    console.error('Supabase signal_log error:', e.message);
+    return null;
+  }
 }
 
 async function logHealth(status, tokenDaysLeft = null) {
@@ -139,8 +190,8 @@ async function logError(signal, errorCode, errorDesc, rawEvent = null) {
     await supabase.from('recent_errors').insert({
       error_time:  new Date().toISOString(),
       signal_id:   signal ? signal.signal_id : null,
-      ticker:      signal ? signal.ticker : null,
-      action:      signal ? signal.action : null,
+      ticker:      signal ? signal.ticker    : null,
+      action:      signal ? signal.action    : null,
       error_code:  errorCode,
       error_desc:  errorDesc,
       raw_event:   rawEvent,
@@ -172,67 +223,93 @@ async function connectToCTrader() {
     console.log("Connecting to cTrader...");
     connection = new CTraderConnection({ host: HOST, port: 5035 });
 
-    // TEMPORARY DIAGNOSTIC
-    connection.on('ProtoOAExecutionEvent', (...args) => { const e = args[0]; console.log('DIAG type:', e.type, 'execType:', e.executionType, 'payload:', e.payloadType); try { console.log('DIAG toJSON:', JSON.stringify(e.toJSON ? e.toJSON() : 'no toJSON').substring(0, 400)); } catch(x) { console.log('DIAG toJSON err:', x.message); } });
-    connection.on('execution', (e) => console.log('DIAG B:', JSON.stringify(e).substring(0, 300)));
-    connection.on('ProtoOAOrderErrorEvent', (e) => console.log('DIAG ERR:', JSON.stringify(e).substring(0, 300)));
-    
-    // ── D3: Execution confirmation deserialisation ────────────────
+    // ── Execution confirmation handler ────────────────────────────
     connection.on('ProtoOAExecutionEvent', async (e) => {
       try {
-        const execType  = e.executionType;
-        const order     = e.order    || {};
-        const position  = e.position || {};
-        const deal      = e.deal     || {};
-
-        if (!['ORDER_FILLED', 'ORDER_PARTIAL_FILL', 'POSITION_CLOSED',
-              'POSITION_PARTIAL_CLOSE'].includes(execType)) return;
-
-        const orderId    = order.orderId    || deal.dealId   || null;
-        const positionId = position.positionId               || null;
-        const fillPrice  = deal.executionPrice               || null;
-        const filledVol  = deal.filledVolume                 || null;
-
-        console.log(`Execution confirmed | type:${execType} | orderId:${orderId} | price:${fillPrice} | vol:${filledVol}`);
-
-        if (orderId || positionId) {
-          // Fetch the most recent unconfirmed EXECUTED row
-          const { data: rows } = await supabase
-            .from('signal_log')
-            .select('id')
-            .eq('status', 'EXECUTED')
-            .is('order_id', null)
-            .order('processed_at', { ascending: false })
-            .limit(1);
-
-          if (rows && rows.length > 0) {
-            const { error } = await supabase
-              .from('signal_log')
-              .update({
-                fill_price:    fillPrice,
-                filled_volume: filledVol,
-                order_id:      orderId,
-                position_id:   positionId,
-                exec_type:     execType,
-              })
-              .eq('id', rows[0].id);
-
-            if (error) console.error('Execution update error:', error.message);
-            else console.log('Execution detail logged | id:', rows[0].id);
-          }
+        // Log the full event structure once on first receipt.
+        // This confirms field paths are correct for our protobufjs version.
+        // Safe to remove after first successful EXECUTED confirmation in Supabase.
+        if (!execEventLogged) {
+          execEventLogged = true;
+          console.log('ExecEvent structure (first):', JSON.stringify(safeSerialise(e)).substring(0, 600));
         }
+
+        if (!pendingDbId) {
+          console.log('ExecEvent received — no pending order, ignoring.');
+          return;
+        }
+
+        // Normalise executionType — handles both string and integer enum forms
+        const execType = normaliseExecType(e.executionType);
+
+        const order    = e.order    || {};
+        const position = e.position || {};
+        const deal     = e.deal     || {};
+
+        // IDs come back as Long objects in protobufjs — coerce to string safely
+        const orderId    = order.orderId       ? String(order.orderId)       : (deal.dealId ? String(deal.dealId) : null);
+        const positionId = position.positionId ? String(position.positionId) : null;
+
+        // Price is stored in cTrader as price * 100000 (5dp). Convert to standard price.
+        const fillPrice  = deal.executionPrice != null ? (deal.executionPrice / 100000).toFixed(5) : null;
+        const filledVol  = deal.filledVolume   != null ? deal.filledVolume : null;
+
+        const isFilled   = FILLED_TYPES.has(execType);
+        const isRejected = REJECTED_TYPES.has(execType);
+
+        console.log(`ExecEvent | type:${execType} | orderId:${orderId} | posId:${positionId} | price:${fillPrice} | vol:${filledVol}`);
+
+        const updatePayload = {
+          exec_type:      execType || 'UNRECOGNISED',
+          order_id:       orderId,
+          position_id:    positionId,
+          fill_price:     fillPrice,
+          filled_volume:  filledVol,
+          api_response:   JSON.stringify(safeSerialise(e)),
+          status:         isFilled ? 'EXECUTED' : isRejected ? 'REJECTED' : 'PENDING_FILL',
+          rejection_code: isRejected ? (e.errorCode    || null) : null,
+          rejection_desc: isRejected ? (e.description  || null) : null,
+        };
+
+        const { error } = await supabase
+          .from('signal_log')
+          .update(updatePayload)
+          .eq('id', pendingDbId);
+
+        if (error) {
+          console.error('Execution update error:', error.message);
+        } else {
+          console.log(`Execution confirmed | dbId:${pendingDbId} | status:${updatePayload.status}`);
+        }
+
+        // Clear pending slot only on terminal states
+        if (isFilled || isRejected) {
+          pendingDbId   = null;
+          pendingTicker = null;
+        }
+
       } catch(err) {
-        console.error('Execution event error:', err.message);
+        console.error('Execution event handler error:', err.message);
       }
     });
 
-    // ── D6: Order rejection capture ───────────────────────────────
+    // ── Order rejection handler ───────────────────────────────────
     connection.on('ProtoOAOrderErrorEvent', async (e) => {
-      const code = e.errorCode    || 'UNKNOWN';
-      const desc = e.description  || '';
+      const code = e.errorCode   || 'UNKNOWN';
+      const desc = e.description || '';
       console.error(`Order rejected | code:${code} | ${desc}`);
-      await logError(null, code, desc, e);
+      await logError(null, code, desc, safeSerialise(e));
       await logAlert('ORDER_REJECTED', 'CRITICAL', `Order rejected: ${code} — ${desc}`);
+      // Update pending row if one exists
+      if (pendingDbId) {
+        await supabase.from('signal_log').update({
+          status:         'REJECTED',
+          rejection_code: code,
+          rejection_desc: desc,
+        }).eq('id', pendingDbId);
+        pendingDbId   = null;
+        pendingTicker = null;
+      }
     });
 
     connection.on('close', () => {
@@ -308,7 +385,7 @@ async function washdownQueue() {
   }
 }
 
-// ── SIGNAL EXECUTION ─────────────────────────────────────────────────
+// ── SIGNAL EXECUTION ──────────────────────────────────────────────────
 async function executeSignal(signal) {
   const latencyMs = getLatencyMs(signal);
 
@@ -343,6 +420,7 @@ async function executeSignal(signal) {
 
   try {
     if (isEntry) {
+      // Check for existing position on this symbol/side before entering
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -361,6 +439,20 @@ async function executeSignal(signal) {
 
       console.log(`Order | ${ctSymbol} | ${signal.action === "LONG" ? "BUY" : "SELL"} | ${volume} cents | SL: ${stopLoss} | latency: ${latencyMs}ms`);
 
+      // Insert as PENDING_FILL — the execution event handler will update to EXECUTED or REJECTED
+      const dbId = await logSignal(
+        signal,
+        { symbolId, volume, stopLoss },
+        'PENDING_FILL',
+        null,
+        latencyMs
+      );
+
+      // Register as the pending order so the async execution event can find this row
+      pendingDbId   = dbId;
+      pendingTicker = ctSymbol;
+
+      // Fire and forget — execution confirmation arrives via ProtoOAExecutionEvent
       connection.sendCommand('ProtoOANewOrderReq', {
         ctidTraderAccountId: ACCOUNT_ID,
         symbolId,
@@ -370,15 +462,22 @@ async function executeSignal(signal) {
         relativeStopLoss: stopLoss,
         comment:          `HAWK|${signal.strategy_id}|S${signal.score}`,
       }).then(() => {
-        console.log("Order sent successfully");
+        console.log("Order sent to cTrader — awaiting execution event");
       }).catch(async (e) => {
         console.error("Order send error:", e.message);
         await logError(signal, 'SEND_ERROR', e.message, null);
+        // If the send itself failed, update the row and clear the pending slot
+        if (pendingDbId === dbId) {
+          await supabase.from('signal_log').update({
+            status: 'ERROR', error_message: e.message,
+          }).eq('id', dbId);
+          pendingDbId   = null;
+          pendingTicker = null;
+        }
       });
 
-      await logSignal(signal, { symbolId, volume, stopLoss }, 'EXECUTED', null, latencyMs);
-
     } else {
+      // Exit signal — find and close the matching position
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -397,7 +496,7 @@ async function executeSignal(signal) {
         positionId:          position.positionId,
         volume:              position.tradeData.volume,
       }).then(() => {
-        console.log("Close sent successfully");
+        console.log("Close sent to cTrader");
       }).catch(async (e) => {
         console.error("Close send error:", e.message);
         await logError(signal, 'CLOSE_ERROR', e.message, null);
@@ -442,13 +541,13 @@ function startHttpServer() {
   });
 }
 
-// ── MAIN ─────────────────────────────────────────────────────────────
+// ── MAIN ──────────────────────────────────────────────────────────────
 async function main() {
   // 1. Refresh token once on startup
   await refreshAccessToken();
 
-  // 2. Schedule token refresh every 20 days (safe within 32-bit integer limit)
-  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000; // 1,728,000,000ms
+  // 2. Schedule token refresh every 20 days
+  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000;
   setInterval(async () => {
     try { await refreshAccessToken(); }
     catch(e) { logAlert('TOKEN_REFRESH_FAILED', 'CRITICAL', e.message); }
