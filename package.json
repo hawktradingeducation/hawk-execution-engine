@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "@reiryoku/ctrader-layer": "latest"
-  }
+  "@reiryoku/ctrader-layer": "...",
+  "@supabase/supabase-js": "...",
+  "express": "^4.18.2"
 }
