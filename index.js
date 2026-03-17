@@ -55,9 +55,6 @@ async function refreshAccessToken() {
 }
 
 // ── VOLUME ────────────────────────────────────────────────────────────
-// Score 7 = 0.04 lots = 400 cents
-// Score 8 = 0.05 lots = 500 cents
-// Score 9 = 0.06 lots = 600 cents
 function getVolume(score) {
   if (score >= 9) return 600;
   if (score >= 8) return 500;
@@ -214,8 +211,6 @@ async function connectToCTrader() {
 }
 
 // ── PIPELINE WASHDOWN ─────────────────────────────────────────────────
-// On startup, flush any signals left in Upstash from previous session.
-// Never execute stale signals.
 async function washdownQueue() {
   try {
     let flushed = 0;
@@ -242,21 +237,18 @@ async function washdownQueue() {
 async function executeSignal(signal) {
   const latencyMs = getLatencyMs(signal);
 
-  // 1. Check signal age
   if (isExpired(signal)) {
     console.warn(`Signal EXPIRED: ${signal.signal_id} | age: ${latencyMs}ms`);
     await logSignal(signal, null, 'EXPIRED', 'Signal age exceeded 5000ms', latencyMs);
     return;
   }
 
-  // 2. Deduplication
   if (isDuplicate(signal.signal_id)) {
     console.log("Duplicate signal ignored:", signal.signal_id);
     await logSignal(signal, null, 'DUPLICATE', null, latencyMs);
     return;
   }
 
-  // 3. Check connection
   if (!isConnected) {
     console.warn("Engine not connected — signal dropped");
     await logSignal(signal, null, 'ERROR', 'Engine not connected', latencyMs);
@@ -276,7 +268,6 @@ async function executeSignal(signal) {
 
   try {
     if (isEntry) {
-      // 4. Position state check — no duplicate positions
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -312,7 +303,6 @@ async function executeSignal(signal) {
       await logSignal(signal, { symbolId, volume, stopLoss }, 'EXECUTED', null, latencyMs);
 
     } else {
-      // EXIT or STOP — close existing position
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -345,13 +335,11 @@ async function executeSignal(signal) {
 }
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────
-// Primary execution path: Cloudflare posts signals directly here.
 function startHttpServer() {
   const app = express();
   app.use(express.json());
 
   app.post('/signal', async (req, res) => {
-    // Validate internal secret
     if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
@@ -359,9 +347,7 @@ function startHttpServer() {
     if (!signal || !signal.signal_id) {
       return res.status(400).json({ error: 'Invalid signal' });
     }
-    // Respond immediately — do not wait for execution
     res.status(200).json({ ok: true });
-    // Execute asynchronously after response
     setImmediate(() => executeSignal(signal));
   });
 
@@ -380,14 +366,15 @@ function startHttpServer() {
 
 // ── MAIN ─────────────────────────────────────────────────────────────
 async function main() {
-  // 1. Refresh token
+  // 1. Refresh token once on startup
   await refreshAccessToken();
 
-  // 2. Schedule token refresh every 25 days
+  // 2. Schedule token refresh every 20 days (safe within 32-bit integer limit)
+  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000; // 1,728,000,000ms — safe
   setInterval(async () => {
     try { await refreshAccessToken(); }
     catch(e) { logAlert('TOKEN_REFRESH_FAILED', 'CRITICAL', e.message); }
-  }, 25 * 24 * 60 * 60 * 1000);
+  }, TWENTY_DAYS_MS);
 
   // 3. Flush stale signals from previous session
   await washdownQueue();
@@ -395,7 +382,7 @@ async function main() {
   // 4. Connect to cTrader
   await connectToCTrader();
 
-  // 5. Start HTTP server for direct signal receipt
+  // 5. Start HTTP server
   startHttpServer();
 
   // 6. Heartbeat every 60 seconds
