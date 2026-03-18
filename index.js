@@ -1,12 +1,12 @@
-// Hawk Execution Engine — index.js v2.2
-// Resilient FAF Pipeline — awaited sendCommand + reconcile polling fallback
+// Hawk Execution Engine — index.js v2.3
+// FAF Pipeline — reconcile confirmation + deal list fill price capture
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.2 STARTING ===");
+console.log("=== HAWK ENGINE v2.3 STARTING ===");
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
@@ -89,51 +89,6 @@ function isDuplicate(signalId) {
   if (seenSignals.has(signalId)) return true;
   seenSignals.set(signalId, now);
   return false;
-}
-
-// ── READ OBJECT — extract data from any object type ──────────────────
-// Handles plain objects, protobuf messages, CTraderLayerEvent wrappers,
-// and anything else. Returns a plain JS object with enumerable data.
-function readObject(obj) {
-  if (!obj) return {};
-  // Try toObject() — standard protobufjs method
-  if (typeof obj.toObject === 'function') {
-    try { return obj.toObject(); } catch(_) {}
-  }
-  // Try toJSON() — alternative protobufjs method
-  if (typeof obj.toJSON === 'function') {
-    try { return obj.toJSON(); } catch(_) {}
-  }
-  // Check for Symbol-keyed properties (CTraderLayerEvent may use these)
-  const symbols = Object.getOwnPropertySymbols(obj);
-  if (symbols.length > 0) {
-    const out = {};
-    for (const sym of symbols) {
-      try { out[sym.toString()] = obj[sym]; } catch(_) {}
-    }
-    return out;
-  }
-  // Check prototype chain for getters
-  const proto = Object.getPrototypeOf(obj);
-  if (proto && proto !== Object.prototype) {
-    const protoProps = Object.getOwnPropertyNames(proto)
-      .filter(k => k !== 'constructor');
-    if (protoProps.length > 0) {
-      const out = {};
-      for (const k of protoProps) {
-        try {
-          const desc = Object.getOwnPropertyDescriptor(proto, k);
-          if (desc && typeof desc.get === 'function') {
-            out[k] = obj[k];
-          }
-        } catch(_) {}
-      }
-      if (Object.keys(out).length > 0) return out;
-    }
-  }
-  // Fallback: plain JSON copy
-  try { return JSON.parse(JSON.stringify(obj)); } catch(_) {}
-  return {};
 }
 
 // ── SUPABASE LOGGING ──────────────────────────────────────────────────
@@ -263,7 +218,7 @@ async function connectToCTrader() {
     isConnected  = true;
     reconnecting = false;
     console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.2 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    await logAlert('ENGINE_READY', 'INFO', `Engine v2.3 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
   } catch(err) {
     console.error("cTrader connection failed:", err.message);
@@ -296,10 +251,55 @@ async function washdownQueue() {
   }
 }
 
-// ── RECONCILE CONFIRMATION ────────────────────────────────────────────
-// Called 1.5s after order send if the sendCommand result was uninformative.
-// ProtoOAReconcileReq is known to return readable data — used as the
-// reliable fallback for confirming execution.
+// ── DEAL LIST — fetch fill price and order ID for a position ──────────
+// cTrader stores every fill as a "deal". ProtoOADealListReq returns deals
+// within a time window. We search the last 60 seconds, match on positionId,
+// and extract executionPrice (stored as price × 100000) and orderId.
+// This gives us the actual broker fill price for spread/slippage analysis.
+async function fetchDealForPosition(positionId, lookbackMs = 60000) {
+  try {
+    const now  = Date.now();
+    const from = now - lookbackMs;
+
+    const dealRes = await connection.sendCommand('ProtoOADealListReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+      fromTimestamp:       from,
+      toTimestamp:         now,
+      maxRows:             50,
+    });
+
+    const deals = dealRes.deal || [];
+    // Find the deal matching our position, preferring FILLED status
+    const match = deals.find(d =>
+      String(d.positionId) === String(positionId) &&
+      d.dealStatus === 'FILLED'
+    ) || deals.find(d =>
+      String(d.positionId) === String(positionId)
+    );
+
+    if (!match) {
+      console.warn(`Deal not found for positionId:${positionId} in last ${lookbackMs}ms`);
+      return { fillPrice: null, orderId: null };
+    }
+
+    // executionPrice is stored as price × 100000 (5 decimal places)
+    const fillPrice = match.executionPrice != null
+      ? (match.executionPrice / 100000).toFixed(5)
+      : null;
+    const orderId   = match.orderId ? String(match.orderId) : null;
+
+    console.log(`Deal found | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice}`);
+    return { fillPrice, orderId };
+
+  } catch(err) {
+    console.error('fetchDealForPosition error:', err.message);
+    return { fillPrice: null, orderId: null };
+  }
+}
+
+// ── RECONCILE CONFIRMATION — entry ────────────────────────────────────
+// Called 1.5s after order send. Confirms position is open via reconcile,
+// then fetches the deal to capture fill price and order ID.
 async function reconcileConfirm(dbId, symbolId, isLong) {
   try {
     console.log(`Reconcile check | dbId:${dbId}`);
@@ -313,31 +313,87 @@ async function reconcileConfirm(dbId, symbolId, isLong) {
       p.tradeData?.tradeSide === tradeSide
     );
 
-    if (position) {
-      const positionId  = position.positionId ? String(position.positionId) : null;
-      const filledVol   = position.tradeData?.volume ?? null;
-      // Reconcile does not return fill price — that only comes via deal data.
-      // Position is confirmed open; fill_price remains null until deal history queried.
-      console.log(`Reconcile CONFIRMED | positionId:${positionId} | vol:${filledVol}`);
-      await supabase.from('signal_log').update({
-        status:        'EXECUTED',
-        position_id:   positionId,
-        filled_volume: filledVol,
-        exec_type:     'RECONCILE_CONFIRMED',
-        api_response:  JSON.stringify({ positionId, filledVol, tradeSide }),
-      }).eq('id', dbId);
-    } else {
-      // No matching position — order was likely rejected or not filled
-      console.warn(`Reconcile: no matching ${tradeSide} position for symbolId ${symbolId}`);
+    if (!position) {
+      console.warn(`Reconcile: no ${tradeSide} position found for symbolId:${symbolId}`);
       await supabase.from('signal_log').update({
         status:    'RECONCILE_NO_POSITION',
         exec_type: 'RECONCILE_NO_POSITION',
       }).eq('id', dbId);
       await logAlert('ORDER_UNCONFIRMED', 'WARN',
         `Order sent but reconcile found no open position. dbId:${dbId}`);
+      return;
     }
+
+    const positionId = position.positionId ? String(position.positionId) : null;
+    const filledVol  = position.tradeData?.volume ?? null;
+    console.log(`Reconcile CONFIRMED | positionId:${positionId} | vol:${filledVol}`);
+
+    // Fetch deal to get actual fill price and order ID
+    const { fillPrice, orderId } = await fetchDealForPosition(positionId);
+
+    await supabase.from('signal_log').update({
+      status:        'EXECUTED',
+      position_id:   positionId,
+      order_id:      orderId,
+      fill_price:    fillPrice,
+      filled_volume: filledVol,
+      exec_type:     'RECONCILE_CONFIRMED',
+      api_response:  JSON.stringify({ positionId, orderId, fillPrice, filledVol, tradeSide }),
+    }).eq('id', dbId);
+
+    console.log(`Entry logged | dbId:${dbId} | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice}`);
+
   } catch(err) {
     console.error('Reconcile confirm error:', err.message);
+    await logAlert('RECONCILE_ERROR', 'CRITICAL',
+      `Reconcile failed for dbId:${dbId} — ${err.message}`);
+  }
+}
+
+// ── EXIT DEAL CONFIRMATION ────────────────────────────────────────────
+// Called 1.5s after a close order is sent.
+// Confirms position is gone (not in reconcile list) and fetches the
+// closing deal to capture exit fill price and order ID.
+async function reconcileExitConfirm(dbId, positionId, symbolId, isLong) {
+  try {
+    console.log(`Exit reconcile check | dbId:${dbId} | positionId:${positionId}`);
+    const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+    });
+
+    const tradeSide   = isLong ? 'BUY' : 'SELL';
+    const stillOpen   = (posRes.position || []).find(p =>
+      String(p.tradeData?.symbolId) === String(symbolId) &&
+      p.tradeData?.tradeSide === tradeSide
+    );
+
+    if (stillOpen) {
+      // Position may still be closing — wait another second and retry once
+      console.warn(`Exit reconcile: position still open, retrying in 1s | dbId:${dbId}`);
+      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1000);
+      return;
+    }
+
+    console.log(`Exit confirmed — position closed | positionId:${positionId}`);
+
+    // Fetch closing deal — use 120s lookback as exits can be slower
+    const { fillPrice: exitFillPrice, orderId: exitOrderId } =
+      await fetchDealForPosition(positionId, 120000);
+
+    await supabase.from('signal_log').update({
+      status:      'CLOSED',
+      exec_type:   'EXIT_CONFIRMED',
+      order_id:    exitOrderId,
+      fill_price:  exitFillPrice,
+      api_response: JSON.stringify({ positionId, exitOrderId, exitFillPrice, tradeSide }),
+    }).eq('id', dbId);
+
+    console.log(`Exit logged | dbId:${dbId} | exitOrderId:${exitOrderId} | exitFillPrice:${exitFillPrice}`);
+
+  } catch(err) {
+    console.error('Exit reconcile error:', err.message);
+    await logAlert('EXIT_RECONCILE_ERROR', 'CRITICAL',
+      `Exit reconcile failed for dbId:${dbId} — ${err.message}`);
   }
 }
 
@@ -395,7 +451,6 @@ async function executeSignal(signal) {
 
       console.log(`Order | ${ctSymbol} | ${isLong ? "BUY" : "SELL"} | ${volume} cents | SL: ${stopLoss} | latency: ${latencyMs}ms`);
 
-      // Log as PENDING_FILL immediately
       const dbId = await logSignal(
         signal,
         { symbolId, volume, stopLoss },
@@ -404,14 +459,8 @@ async function executeSignal(signal) {
         latencyMs
       );
 
-      // ── Strategy A: Await sendCommand ─────────────────────────
-      // The library may resolve the promise with execution data.
-      // Log the raw result regardless — this is our one remaining
-      // diagnostic window to understand what the library returns.
-      let orderResult = null;
-      let orderError  = null;
       try {
-        orderResult = await connection.sendCommand('ProtoOANewOrderReq', {
+        await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId,
           orderType:        'MARKET',
@@ -420,54 +469,8 @@ async function executeSignal(signal) {
           relativeStopLoss: stopLoss,
           comment:          `HAWK|${signal.strategy_id}|S${signal.score}`,
         });
-
-        // Log everything we can extract from the result
-        console.log('Order result constructor:', orderResult?.constructor?.name);
-        const symbols = orderResult ? Object.getOwnPropertySymbols(orderResult) : [];
-        console.log('Order result symbols:', symbols.length);
-        const proto = orderResult ? Object.getPrototypeOf(orderResult) : null;
-        const protoMethods = proto ? Object.getOwnPropertyNames(proto).filter(k => k !== 'constructor').join(',') : 'none';
-        console.log('Order result proto methods:', protoMethods);
-
-        // Attempt all extraction paths
-        const extracted = readObject(orderResult);
-        console.log('Order result extracted:', JSON.stringify(extracted).substring(0, 500));
-
-        // Check if we got real execution data from the result
-        const execType   = extracted.executionType ?? null;
-        const order      = extracted.order    || {};
-        const position   = extracted.position || {};
-        const deal       = extracted.deal     || {};
-        const orderId    = order.orderId    ? String(order.orderId)    : (deal.dealId    ? String(deal.dealId)    : null);
-        const positionId = position.positionId ? String(position.positionId) : null;
-        const fillPrice  = deal.executionPrice != null ? (deal.executionPrice / 100000).toFixed(5) : null;
-        const filledVol  = deal.filledVolume ?? null;
-
-        const FILLED_EXEC   = new Set(['ORDER_FILLED', 'ORDER_PARTIAL_FILL', 2, 3]);
-        const REJECTED_EXEC = new Set(['ORDER_REJECTED', 'ORDER_CANCEL_REJECTED', 6, 7]);
-        const isFilled   = FILLED_EXEC.has(execType);
-        const isRejected = REJECTED_EXEC.has(execType);
-
-        if (isFilled || isRejected || orderId || positionId) {
-          // Strategy A succeeded — execution data available from sendCommand result
-          console.log(`Strategy A succeeded | execType:${execType} | orderId:${orderId} | posId:${positionId} | price:${fillPrice}`);
-          await supabase.from('signal_log').update({
-            status:        isFilled ? 'EXECUTED' : isRejected ? 'REJECTED' : 'EXECUTED',
-            exec_type:     execType ? String(execType) : 'SENDCMD_CONFIRMED',
-            order_id:      orderId,
-            position_id:   positionId,
-            fill_price:    fillPrice,
-            filled_volume: filledVol,
-            api_response:  JSON.stringify(extracted),
-          }).eq('id', dbId);
-          return; // Done — no reconcile needed
-        }
-
-        // Strategy A returned something but no useful execution fields
-        console.log("Strategy A: order sent, no execution fields in result — falling back to reconcile");
-
+        console.log("Order sent to cTrader");
       } catch(e) {
-        orderError = e.message;
         console.error("Order send error:", e.message);
         await logError(signal, 'SEND_ERROR', e.message, null);
         await supabase.from('signal_log').update({
@@ -476,14 +479,11 @@ async function executeSignal(signal) {
         return;
       }
 
-      // ── Strategy B: Reconcile fallback ────────────────────────
-      // sendCommand did not return usable execution data.
-      // Wait 1.5s for cTrader to register the position, then reconcile.
-      console.log(`Scheduling reconcile confirm | dbId:${dbId} | in 1500ms`);
+      // Reconcile after 1.5s — confirms position and fetches deal for fill price
       setTimeout(() => reconcileConfirm(dbId, symbolId, isLong), 1500);
 
     } else {
-      // ── Exit signal ───────────────────────────────────────────
+      // Exit signal — find matching position then close it
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -496,8 +496,18 @@ async function executeSignal(signal) {
         await logSignal(signal, null, 'NO_POSITION', null, latencyMs);
         return;
       }
+
       const positionId = position.positionId ? String(position.positionId) : null;
       console.log("Closing position:", positionId, "| latency:", latencyMs + "ms");
+
+      // Log exit signal immediately as PENDING_CLOSE
+      const dbId = await logSignal(
+        signal,
+        { positionId },
+        'PENDING_CLOSE',
+        null,
+        latencyMs
+      );
 
       try {
         await connection.sendCommand('ProtoOAClosePositionReq', {
@@ -509,8 +519,14 @@ async function executeSignal(signal) {
       } catch(e) {
         console.error("Close send error:", e.message);
         await logError(signal, 'CLOSE_ERROR', e.message, null);
+        await supabase.from('signal_log').update({
+          status: 'ERROR', error_message: e.message,
+        }).eq('id', dbId);
+        return;
       }
-      await logSignal(signal, { positionId }, 'CLOSED', null, latencyMs);
+
+      // Reconcile exit after 1.5s — confirms position closed and fetches exit fill price
+      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1500);
     }
 
   } catch(err) {
@@ -541,7 +557,7 @@ function startHttpServer() {
       status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:    IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:  process.uptime(),
-      version: '2.2',
+      version: '2.3',
     });
   });
 
