@@ -1,12 +1,12 @@
-// Hawk Execution Engine — index.js v2.4 FINAL
-// FAF Pipeline — reconcile confirmation + deal list fill price (broker-scaled)
+// Hawk Execution Engine — index.js v2.5
+// FAF Pipeline — reconcile confirmation + deal list fill price + active position polling
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.4 STARTING ===");
+console.log("=== HAWK ENGINE v2.5 STARTING ===");
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
@@ -221,7 +221,7 @@ async function connectToCTrader() {
     isConnected  = true;
     reconnecting = false;
     console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.4 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    await logAlert('ENGINE_READY', 'INFO', `Engine v2.5 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
   } catch(err) {
     console.error("cTrader connection failed:", err.message);
@@ -254,11 +254,77 @@ async function washdownQueue() {
   }
 }
 
+// ── ACTIVE POSITION POLLING ───────────────────────────────────────────
+// Runs every 30s. Calls ProtoOAReconcileReq and upserts the current open
+// positions into the active_positions table for the dashboard.
+// Rows for positions that have closed are automatically deleted.
+async function pollActivePositions() {
+  if (!isConnected) return;
+  try {
+    const posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+    });
+    const positions = posRes.position || [];
+
+    if (positions.length === 0) {
+      // No open positions — clear the table for this mode
+      await supabase.from('active_positions').delete().eq('is_paper', IS_PAPER);
+      return;
+    }
+
+    // Build upsert rows — reverse-lookup ticker name from symbolIdMap
+    const rows = positions.map(p => {
+      const td    = p.tradeData || {};
+      const symId = String(td.symbolId || '');
+      const ticker = Object.keys(SYMBOL_MAP).find(
+        k => String(symbolIdMap[SYMBOL_MAP[k]]) === symId
+      ) || symId;
+      return {
+        position_id:   String(p.positionId),
+        ticker,
+        trade_side:    td.tradeSide    || 'UNKNOWN',
+        volume:        td.volume       || null,
+        entry_price:   td.openPrice != null
+                         ? parseFloat(td.openPrice).toFixed(2)
+                         : null,
+        swap:          p.swap          || null,
+        open_time:     td.openTimestamp
+                         ? new Date(parseInt(td.openTimestamp)).toISOString()
+                         : null,
+        stop_loss:     p.stopLoss != null
+                         ? parseFloat(p.stopLoss).toFixed(2)
+                         : null,
+        is_paper:      IS_PAPER,
+        updated_at:    new Date().toISOString(),
+      };
+    });
+
+    // Upsert all currently open positions
+    const { error } = await supabase
+      .from('active_positions')
+      .upsert(rows, { onConflict: 'position_id' });
+
+    if (error) {
+      console.error('active_positions upsert error:', error.message);
+      return;
+    }
+
+    // Delete any stale rows not in the current snapshot
+    const openIds = rows.map(r => r.position_id);
+    await supabase
+      .from('active_positions')
+      .delete()
+      .eq('is_paper', IS_PAPER)
+      .not('position_id', 'in', `(${openIds.join(',')})`);
+
+    console.log(`Positions polled: ${rows.length} open`);
+
+  } catch(err) {
+    console.error('pollActivePositions error:', err.message);
+  }
+}
+
 // ── DEAL LIST — fetch fill price and order ID for a position ──────────
-// The @reiryoku/ctrader-layer library returns executionPrice already
-// converted to a human-readable float (e.g. 5002.67 for XAUUSD).
-// We round to 2 decimal places for all instruments — sufficient precision
-// for gold, indices, and crypto at current price levels.
 async function fetchDealForPosition(positionId, lookbackMs = 60000) {
   try {
     const now  = Date.now();
@@ -272,8 +338,6 @@ async function fetchDealForPosition(positionId, lookbackMs = 60000) {
     });
 
     const deals = dealRes.deal || [];
-
-    // Match on positionId — prefer FILLED, fall back to any match
     const match = deals.find(d =>
       String(d.positionId) === String(positionId) && d.dealStatus === 'FILLED'
     ) || deals.find(d =>
@@ -285,7 +349,6 @@ async function fetchDealForPosition(positionId, lookbackMs = 60000) {
       return { fillPrice: null, orderId: null, filledVolume: null };
     }
 
-    // executionPrice is already human-readable from the library — round to 2dp
     const fillPrice    = match.executionPrice != null
       ? parseFloat(match.executionPrice).toFixed(2)
       : null;
@@ -380,7 +443,6 @@ async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt 
 
     console.log(`Exit confirmed — position closed | positionId:${positionId}`);
 
-    // 120s lookback for exit deals — closing fills can take slightly longer to register
     const { fillPrice: exitFillPrice, orderId: exitOrderId, filledVolume: exitVol } =
       await fetchDealForPosition(positionId, 120000);
 
@@ -438,7 +500,7 @@ async function executeSignal(signal) {
 
   try {
     if (isEntry) {
-      // Enforce one position per ticker per side — server-side pyramiding guard
+      // Enforce one position per ticker per side
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -485,7 +547,6 @@ async function executeSignal(signal) {
         return;
       }
 
-      // Reconcile after 1.5s — confirms position and fetches deal for fill price
       setTimeout(() => reconcileConfirm(dbId, symbolId, isLong), 1500);
 
     } else {
@@ -530,7 +591,6 @@ async function executeSignal(signal) {
         return;
       }
 
-      // Reconcile exit after 1.5s — confirms close and fetches exit fill price
       setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1500);
     }
 
@@ -562,7 +622,7 @@ function startHttpServer() {
       status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:    IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:  process.uptime(),
-      version: '2.4',
+      version: '2.5',
     });
   });
 
@@ -585,6 +645,7 @@ async function main() {
   await connectToCTrader();
   startHttpServer();
 
+  // Heartbeat every 60 seconds
   setInterval(async () => {
     const daysLeft = tokenExpiryTime
       ? Math.floor((tokenExpiryTime - Date.now()) / 86400000) : null;
@@ -594,6 +655,9 @@ async function main() {
         `cTrader access token expires in ${daysLeft} days. Immediate action required.`);
     }
   }, 60000);
+
+  // Poll active positions every 30 seconds for dashboard
+  setInterval(pollActivePositions, 30000);
 }
 
 main().catch(err => {
