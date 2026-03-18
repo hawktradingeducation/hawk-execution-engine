@@ -1,12 +1,12 @@
-// Hawk Execution Engine — index.js v2.3
-// FAF Pipeline — reconcile confirmation + deal list fill price capture
+// Hawk Execution Engine — index.js v2.4
+// FAF Pipeline — reconcile confirmation + deal list fill price + correct price scaling
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.3 STARTING ===");
+console.log("=== HAWK ENGINE v2.4 STARTING ===");
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
@@ -91,6 +91,30 @@ function isDuplicate(signalId) {
   return false;
 }
 
+// ── PRICE SCALING ─────────────────────────────────────────────────────
+// cTrader stores prices as integer * 10^digits, where digits is the
+// decimal precision of the instrument as defined in the symbol list.
+// e.g. EURUSD digits=5: raw 108500 → 1.08500
+//      XAUUSD digits=2: raw 501400 → 5014.00
+// We store digits per symbol at startup and apply the correct divisor here.
+function scalePrice(rawPrice, digits) {
+  if (rawPrice == null) return null;
+  const divisor = Math.pow(10, digits ?? 5); // default 5 if unknown (safe for forex)
+  return (rawPrice / divisor).toFixed(digits ?? 5);
+}
+
+// ── SYMBOL MAP ────────────────────────────────────────────────────────
+// Stores both symbolId and digits per instrument name.
+const SYMBOL_MAP = {
+  "XAUUSD": "XAUUSD",
+  "BTCUSD": "BTCUSD",
+  "NAS100": "NAS100",
+  "USOIL":  "XTIUSD",
+};
+
+// symbolIdMap[name] = { id, digits }
+let symbolIdMap = {};
+
 // ── SUPABASE LOGGING ──────────────────────────────────────────────────
 async function logSignal(signal, result, status, errorMsg = null, latencyMs = null) {
   try {
@@ -155,17 +179,8 @@ async function logError(signal, errorCode, errorDesc, rawEvent = null) {
   } catch(e) { console.error('Supabase recent_errors error:', e.message); }
 }
 
-// ── SYMBOL MAP ────────────────────────────────────────────────────────
-const SYMBOL_MAP = {
-  "XAUUSD": "XAUUSD",
-  "BTCUSD": "BTCUSD",
-  "NAS100": "NAS100",
-  "USOIL":  "XTIUSD",
-};
-
 // ── CTRADER CONNECTION ────────────────────────────────────────────────
 let connection   = null;
-let symbolIdMap  = {};
 let isConnected  = false;
 let reconnecting = false;
 
@@ -205,20 +220,33 @@ async function connectToCTrader() {
     });
     console.log("Account authenticated:", ACCOUNT_ID);
 
+    // Load symbol list — store both id and digits per symbol
     const symRes = await connection.sendCommand('ProtoOASymbolsListReq', {
       ctidTraderAccountId: ACCOUNT_ID,
       includeArchivedSymbols: false,
     });
     symbolIdMap = {};
-    (symRes.symbol || []).forEach(s => { symbolIdMap[s.symbolName] = s.symbolId; });
+    (symRes.symbol || []).forEach(s => {
+      symbolIdMap[s.symbolName] = {
+        id:     s.symbolId,
+        digits: s.digits ?? 5,   // digits: decimal places for this instrument
+      };
+    });
     console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
+
+    // Log digits for our key instruments so we can verify scaling
+    for (const name of Object.keys(SYMBOL_MAP)) {
+      const ct = SYMBOL_MAP[name];
+      const sym = symbolIdMap[ct];
+      if (sym) console.log(`Symbol | ${name} → id:${sym.id} digits:${sym.digits}`);
+    }
 
     setInterval(() => connection.sendHeartbeat(), 25000);
 
     isConnected  = true;
     reconnecting = false;
     console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.3 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    await logAlert('ENGINE_READY', 'INFO', `Engine v2.4 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
   } catch(err) {
     console.error("cTrader connection failed:", err.message);
@@ -252,11 +280,9 @@ async function washdownQueue() {
 }
 
 // ── DEAL LIST — fetch fill price and order ID for a position ──────────
-// cTrader stores every fill as a "deal". ProtoOADealListReq returns deals
-// within a time window. We search the last 60 seconds, match on positionId,
-// and extract executionPrice (stored as price × 100000) and orderId.
-// This gives us the actual broker fill price for spread/slippage analysis.
-async function fetchDealForPosition(positionId, lookbackMs = 60000) {
+// Fetches deals within a lookback window, matches on positionId,
+// and applies correct price scaling using the symbol's digits value.
+async function fetchDealForPosition(positionId, digits, lookbackMs = 60000) {
   try {
     const now  = Date.now();
     const from = now - lookbackMs;
@@ -269,38 +295,35 @@ async function fetchDealForPosition(positionId, lookbackMs = 60000) {
     });
 
     const deals = dealRes.deal || [];
-    // Find the deal matching our position, preferring FILLED status
+
+    // Match on positionId — prefer FILLED status, fall back to any match
     const match = deals.find(d =>
-      String(d.positionId) === String(positionId) &&
-      d.dealStatus === 'FILLED'
+      String(d.positionId) === String(positionId) && d.dealStatus === 'FILLED'
     ) || deals.find(d =>
       String(d.positionId) === String(positionId)
     );
 
     if (!match) {
       console.warn(`Deal not found for positionId:${positionId} in last ${lookbackMs}ms`);
-      return { fillPrice: null, orderId: null };
+      return { fillPrice: null, orderId: null, filledVolume: null };
     }
 
-    // executionPrice is stored as price × 100000 (5 decimal places)
-    const fillPrice = match.executionPrice != null
-      ? (match.executionPrice / 100000).toFixed(5)
-      : null;
-    const orderId   = match.orderId ? String(match.orderId) : null;
+    // Apply correct price scaling for this instrument
+    const fillPrice    = scalePrice(match.executionPrice, digits);
+    const orderId      = match.orderId     ? String(match.orderId)  : null;
+    const filledVolume = match.filledVolume ?? null;
 
-    console.log(`Deal found | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice}`);
-    return { fillPrice, orderId };
+    console.log(`Deal found | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice} (raw:${match.executionPrice} digits:${digits})`);
+    return { fillPrice, orderId, filledVolume };
 
   } catch(err) {
     console.error('fetchDealForPosition error:', err.message);
-    return { fillPrice: null, orderId: null };
+    return { fillPrice: null, orderId: null, filledVolume: null };
   }
 }
 
 // ── RECONCILE CONFIRMATION — entry ────────────────────────────────────
-// Called 1.5s after order send. Confirms position is open via reconcile,
-// then fetches the deal to capture fill price and order ID.
-async function reconcileConfirm(dbId, symbolId, isLong) {
+async function reconcileConfirm(dbId, symbolId, digits, isLong) {
   try {
     console.log(`Reconcile check | dbId:${dbId}`);
     const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
@@ -328,8 +351,8 @@ async function reconcileConfirm(dbId, symbolId, isLong) {
     const filledVol  = position.tradeData?.volume ?? null;
     console.log(`Reconcile CONFIRMED | positionId:${positionId} | vol:${filledVol}`);
 
-    // Fetch deal to get actual fill price and order ID
-    const { fillPrice, orderId } = await fetchDealForPosition(positionId);
+    // Fetch deal using correct digits for this instrument
+    const { fillPrice, orderId } = await fetchDealForPosition(positionId, digits);
 
     await supabase.from('signal_log').update({
       status:        'EXECUTED',
@@ -351,44 +374,50 @@ async function reconcileConfirm(dbId, symbolId, isLong) {
 }
 
 // ── EXIT DEAL CONFIRMATION ────────────────────────────────────────────
-// Called 1.5s after a close order is sent.
-// Confirms position is gone (not in reconcile list) and fetches the
-// closing deal to capture exit fill price and order ID.
-async function reconcileExitConfirm(dbId, positionId, symbolId, isLong) {
+async function reconcileExitConfirm(dbId, positionId, symbolId, digits, isLong, attempt = 1) {
   try {
-    console.log(`Exit reconcile check | dbId:${dbId} | positionId:${positionId}`);
+    console.log(`Exit reconcile check | dbId:${dbId} | positionId:${positionId} | attempt:${attempt}`);
     const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
       ctidTraderAccountId: ACCOUNT_ID,
     });
 
-    const tradeSide   = isLong ? 'BUY' : 'SELL';
-    const stillOpen   = (posRes.position || []).find(p =>
+    const tradeSide = isLong ? 'BUY' : 'SELL';
+    const stillOpen = (posRes.position || []).find(p =>
       String(p.tradeData?.symbolId) === String(symbolId) &&
       p.tradeData?.tradeSide === tradeSide
     );
 
+    if (stillOpen && attempt < 3) {
+      // Position still closing — retry up to 3 times at 1s intervals
+      console.warn(`Exit reconcile: position still open | retrying in 1s | dbId:${dbId}`);
+      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, digits, isLong, attempt + 1), 1000);
+      return;
+    }
+
     if (stillOpen) {
-      // Position may still be closing — wait another second and retry once
-      console.warn(`Exit reconcile: position still open, retrying in 1s | dbId:${dbId}`);
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1000);
+      console.error(`Exit reconcile: position still open after ${attempt} attempts | dbId:${dbId}`);
+      await logAlert('EXIT_UNCONFIRMED', 'WARN',
+        `Close sent but position still open after ${attempt} checks. dbId:${dbId}`);
       return;
     }
 
     console.log(`Exit confirmed — position closed | positionId:${positionId}`);
 
-    // Fetch closing deal — use 120s lookback as exits can be slower
-    const { fillPrice: exitFillPrice, orderId: exitOrderId } =
-      await fetchDealForPosition(positionId, 120000);
+    // Fetch closing deal — 120s lookback for exits
+    const { fillPrice: exitFillPrice, orderId: exitOrderId, filledVolume: exitVol } =
+      await fetchDealForPosition(positionId, digits, 120000);
 
     await supabase.from('signal_log').update({
-      status:      'CLOSED',
-      exec_type:   'EXIT_CONFIRMED',
-      order_id:    exitOrderId,
-      fill_price:  exitFillPrice,
-      api_response: JSON.stringify({ positionId, exitOrderId, exitFillPrice, tradeSide }),
+      status:        'CLOSED',
+      exec_type:     'EXIT_CONFIRMED',
+      position_id:   positionId,
+      order_id:      exitOrderId,
+      fill_price:    exitFillPrice,
+      filled_volume: exitVol,
+      api_response:  JSON.stringify({ positionId, exitOrderId, exitFillPrice, exitVol, tradeSide }),
     }).eq('id', dbId);
 
-    console.log(`Exit logged | dbId:${dbId} | exitOrderId:${exitOrderId} | exitFillPrice:${exitFillPrice}`);
+    console.log(`Exit logged | dbId:${dbId} | positionId:${positionId} | exitOrderId:${exitOrderId} | exitFillPrice:${exitFillPrice}`);
 
   } catch(err) {
     console.error('Exit reconcile error:', err.message);
@@ -422,13 +451,15 @@ async function executeSignal(signal) {
   const isEntry  = signal.action === 'LONG'  || signal.action === 'SHORT';
   const isLong   = signal.action === 'LONG'  || signal.action === 'LONG_EXIT'  || signal.action === 'LONG_STOP';
   const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
-  const symbolId = symbolIdMap[ctSymbol];
+  const symInfo  = symbolIdMap[ctSymbol];
 
-  if (!symbolId) {
+  if (!symInfo) {
     console.error("Symbol not found:", ctSymbol);
     await logSignal(signal, null, 'ERROR', 'Symbol not found: ' + ctSymbol, latencyMs);
     return;
   }
+
+  const { id: symbolId, digits } = symInfo;
 
   try {
     if (isEntry) {
@@ -480,10 +511,10 @@ async function executeSignal(signal) {
       }
 
       // Reconcile after 1.5s — confirms position and fetches deal for fill price
-      setTimeout(() => reconcileConfirm(dbId, symbolId, isLong), 1500);
+      setTimeout(() => reconcileConfirm(dbId, symbolId, digits, isLong), 1500);
 
     } else {
-      // Exit signal — find matching position then close it
+      // Exit signal — find matching position then close
       const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
@@ -500,7 +531,6 @@ async function executeSignal(signal) {
       const positionId = position.positionId ? String(position.positionId) : null;
       console.log("Closing position:", positionId, "| latency:", latencyMs + "ms");
 
-      // Log exit signal immediately as PENDING_CLOSE
       const dbId = await logSignal(
         signal,
         { positionId },
@@ -525,8 +555,8 @@ async function executeSignal(signal) {
         return;
       }
 
-      // Reconcile exit after 1.5s — confirms position closed and fetches exit fill price
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1500);
+      // Reconcile exit after 1.5s — confirms close and fetches exit fill price
+      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, digits, isLong), 1500);
     }
 
   } catch(err) {
@@ -557,7 +587,7 @@ function startHttpServer() {
       status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:    IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:  process.uptime(),
-      version: '2.3',
+      version: '2.4',
     });
   });
 
