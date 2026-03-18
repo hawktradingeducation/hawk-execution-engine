@@ -1,12 +1,12 @@
-// Hawk Execution Engine — index.js v2.5
-// FAF Pipeline — reconcile confirmation + deal list fill price + active position polling
+// Hawk Execution Engine — index.js v2.6
+// FAF Pipeline — reconcile confirmation + deal list fill price + active position polling + queue depth monitor
 "use strict";
 
 const { CTraderConnection } = require("@reiryoku/ctrader-layer");
 const { createClient }      = require("@supabase/supabase-js");
 const express               = require("express");
 
-console.log("=== HAWK ENGINE v2.5 STARTING ===");
+console.log("=== HAWK ENGINE v2.6 STARTING ===");
 
 // ── ENV VARS ──────────────────────────────────────────────────────────
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
@@ -221,7 +221,7 @@ async function connectToCTrader() {
     isConnected  = true;
     reconnecting = false;
     console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.5 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    await logAlert('ENGINE_READY', 'INFO', `Engine v2.6 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
   } catch(err) {
     console.error("cTrader connection failed:", err.message);
@@ -254,10 +254,42 @@ async function washdownQueue() {
   }
 }
 
+// ── QUEUE DEPTH MONITOR ───────────────────────────────────────────────
+// Under normal operation the queue is always 0 — signals go via direct
+// HTTP and the queue is never used. A non-zero depth means Railway is
+// unavailable and signals are accumulating in Upstash.
+// Depth 1-4: WARN alert.
+// Depth 5+:  CRITICAL alert + automatic washdown to prevent stale execution.
+const QUEUE_WARN_THRESHOLD     = 1;
+const QUEUE_CRITICAL_THRESHOLD = 5;
+
+async function checkQueueDepth() {
+  try {
+    const res   = await fetch(`${UPSTASH_URL}/llen/hawk:signals`,
+      { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+    const data  = await res.json();
+    const depth = data.result ?? 0;
+
+    if (depth === 0) return; // Normal — do nothing
+
+    console.log(`Queue depth: ${depth}`);
+
+    if (depth >= QUEUE_CRITICAL_THRESHOLD) {
+      await logAlert('QUEUE_DEPTH_CRITICAL', 'CRITICAL',
+        `Queue depth ${depth} exceeds threshold. Flushing stale signals.`);
+      await washdownQueue();
+    } else if (depth >= QUEUE_WARN_THRESHOLD) {
+      await logAlert('QUEUE_DEPTH_WARNING', 'WARN',
+        `Queue depth ${depth} — Railway may be unavailable.`);
+    }
+  } catch(err) {
+    console.error('checkQueueDepth error:', err.message);
+  }
+}
+
 // ── ACTIVE POSITION POLLING ───────────────────────────────────────────
-// Runs every 30s. Calls ProtoOAReconcileReq and upserts the current open
-// positions into the active_positions table for the dashboard.
-// Rows for positions that have closed are automatically deleted.
+// Runs every 30s. Upserts current open positions to Supabase
+// active_positions table for the dashboard positions panel.
 async function pollActivePositions() {
   if (!isConnected) return;
   try {
@@ -267,12 +299,10 @@ async function pollActivePositions() {
     const positions = posRes.position || [];
 
     if (positions.length === 0) {
-      // No open positions — clear the table for this mode
       await supabase.from('active_positions').delete().eq('is_paper', IS_PAPER);
       return;
     }
 
-    // Build upsert rows — reverse-lookup ticker name from symbolIdMap
     const rows = positions.map(p => {
       const td    = p.tradeData || {};
       const symId = String(td.symbolId || '');
@@ -299,7 +329,6 @@ async function pollActivePositions() {
       };
     });
 
-    // Upsert all currently open positions
     const { error } = await supabase
       .from('active_positions')
       .upsert(rows, { onConflict: 'position_id' });
@@ -309,7 +338,6 @@ async function pollActivePositions() {
       return;
     }
 
-    // Delete any stale rows not in the current snapshot
     const openIds = rows.map(r => r.position_id);
     await supabase
       .from('active_positions')
@@ -622,7 +650,7 @@ function startHttpServer() {
       status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:    IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:  process.uptime(),
-      version: '2.5',
+      version: '2.6',
     });
   });
 
@@ -642,6 +670,8 @@ async function main() {
   }, TWENTY_DAYS_MS);
 
   await washdownQueue();
+  await checkQueueDepth(); // Check queue depth immediately on startup
+
   await connectToCTrader();
   startHttpServer();
 
@@ -658,6 +688,9 @@ async function main() {
 
   // Poll active positions every 30 seconds for dashboard
   setInterval(pollActivePositions, 30000);
+
+  // Monitor queue depth every 60 seconds
+  setInterval(checkQueueDepth, 60000);
 }
 
 main().catch(err => {
