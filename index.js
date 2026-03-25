@@ -1,18 +1,18 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║  HAWK EXECUTION ENGINE  —  index.js  v2.7                       ║
-// ║  Changes vs v2.6:                                                ║
-// ║  - SPOTCRUDE removed from SYMBOL_MAP                             ║
-// ║  - SPOTBRENT, AUS200, GER40, ETHUSD, XAGUSD, BTCUSD added       ║
-// ║  - getVolume() updated with confirmed lot sizes (fallback only)  ║
-// ║  - Engine now reads lot_size from payload if present (primary)   ║
+// ║  HAWK EXECUTION ENGINE  —  index.js  v2.8                       ║
+// ║  Changes vs v2.7:                                                ║
+// ║  - buildProtoMessage: corrected field 1/2 (was 3/5)             ║
+// ║  - All builder functions: restored buildProtoMessage() call      ║
+// ║    (comma operator bug — was returning raw body only)            ║
+// ║  - handleIncomingMessage: corrected field 1/2 (was 3/5)         ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const net             = require('net');
-const http            = require('http');
+const net              = require('net');
+const http             = require('http');
 
-// ── ENVIRONMENT ──────────────────────────────────────────────────────────────
+// ── ENVIRONMENT ───────────────────────────────────────────────────────────────
 const CTRADER_CLIENT_ID    = process.env.CTRADER_CLIENT_ID;
 const CTRADER_SECRET       = process.env.CTRADER_CLIENT_SECRET;
 const CTRADER_REFRESH      = process.env.CTRADER_REFRESH_TOKEN;
@@ -23,16 +23,13 @@ const INTERNAL_SECRET      = process.env.INTERNAL_SECRET;
 const IS_PAPER             = (process.env.IS_PAPER || 'true') !== 'false';
 const PORT                 = parseInt(process.env.PORT || '3000');
 
-const CT_HOST = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
-
+const CT_HOST  = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// ── TOKEN MANAGEMENT ─────────────────────────────────────────────────────────
-// We refresh automatically 30 seconds before expiry so execution is never
-// interrupted. Every Railway redeploy triggers a fresh token refresh and
-// consumes the current refresh token — check the logs for the new expiry.
-let accessToken   = null;
-let tokenExpiry   = 0;
+// ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
+let accessToken    = null;
+let tokenExpiry    = 0;
+let tokenExpiryTime = null;
 
 async function getAccessToken() {
   if (accessToken && Date.now() < tokenExpiry - 30000) return accessToken;
@@ -56,9 +53,7 @@ async function getAccessToken() {
   return accessToken;
 }
 
-// ── SYMBOL MAP: TradingView ticker → cTrader symbol name ─────────────────────
-// Verify each name in your Pepperstone paper account before going live.
-// SPOTCRUDE has been removed. SPOTBRENT replaces it.
+// ── SYMBOL MAP ────────────────────────────────────────────────────────────────
 const SYMBOL_MAP = {
   'XAUUSD':    'XAUUSD',
   'BTCUSD':    'BTCUSD',
@@ -70,62 +65,29 @@ const SYMBOL_MAP = {
   'SPOTBRENT': 'SPOTBRENT',
 };
 
-// ── VOLUME FALLBACK: score + ticker → cTrader units ──────────────────────────
-// PRIMARY PATH: the engine reads lot_size directly from the signal payload.
-//   lot_size is sent by the Pine Script alert as a dynamic variable.
-//   cTrader units = lot_size × 100.
+// ── VOLUME FALLBACK ───────────────────────────────────────────────────────────
+// Primary path: lot_size from Pine Script payload (lot_size × 100 = units).
+// Fallback: hardcoded lookup below.
 //
-// FALLBACK PATH (legacy signals without lot_size field): this function is used.
-//   Units = lots × 100. Scores 7/8/9 map to the confirmed lot sizes below.
-//
-// ⚠ NAS100 Score 7 is set to 0 units (0.0 lots) per the provided table.
-//   A zero-volume order will be rejected by cTrader. Confirm this is correct
-//   before deploying, or update to 100 (1.0 lot) if it was a data entry error.
-//
+// ⚠ NAS100 score 7 returns 0 units — cTrader will reject a zero-volume order.
+//   Verify this is intentional before going live.
 function getVolume(score, ticker) {
   const s = parseInt(score);
   switch (ticker) {
-    case 'XAUUSD':
-      // 0.04 / 0.05 / 0.06 lots
-      return s >= 9 ? 6 : s >= 8 ? 5 : 4;
-
-    case 'BTCUSD':
-      // 0.01 / 0.02 / 0.03 lots
-      return s >= 9 ? 3 : s >= 8 ? 2 : 1;
-
-    case 'ETHUSD':
-      // 0.5 / 0.75 / 1.0 lots
-      return s >= 9 ? 100 : s >= 8 ? 75 : 50;
-
-    case 'XAGUSD':
-      // 0.1 / 0.2 / 0.3 lots
-      return s >= 9 ? 30 : s >= 8 ? 20 : 10;
-
-    case 'NAS100':
-      // 1.0 / 1.5 / 2.0 lots — Score 7 = 0 UNITS. Verify this is intentional.
-      return s >= 9 ? 200 : s >= 8 ? 150 : 0;
-
-    case 'GER40':
-      // 0.5 / 1.0 / 1.5 lots
-      return s >= 9 ? 150 : s >= 8 ? 100 : 50;
-
-    case 'AUS200':
-      // 1.0 / 1.5 / 2.0 lots
-      return s >= 9 ? 200 : s >= 8 ? 150 : 100;
-
-    case 'SPOTBRENT':
-      // 1.0 / 1.5 / 2.0 lots
-      return s >= 9 ? 200 : s >= 8 ? 150 : 100;
-
+    case 'XAUUSD':    return s >= 9 ? 6   : s >= 8 ? 5   : 4;
+    case 'BTCUSD':    return s >= 9 ? 3   : s >= 8 ? 2   : 1;
+    case 'ETHUSD':    return s >= 9 ? 100 : s >= 8 ? 75  : 50;
+    case 'XAGUSD':    return s >= 9 ? 30  : s >= 8 ? 20  : 10;
+    case 'NAS100':    return s >= 9 ? 200 : s >= 8 ? 150 : 0;
+    case 'GER40':     return s >= 9 ? 150 : s >= 8 ? 100 : 50;
+    case 'AUS200':    return s >= 9 ? 200 : s >= 8 ? 150 : 100;
+    case 'SPOTBRENT': return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     default:
       console.warn(`[VOLUME WARNING] No fallback rule for ticker: ${ticker}. Defaulting to 1 unit.`);
       return 1;
   }
 }
 
-// ── RESOLVE VOLUME FROM SIGNAL ────────────────────────────────────────────────
-// Primary path: use lot_size from the Pine Script payload.
-// Fallback: use the hardcoded getVolume() lookup above.
 function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
@@ -135,13 +97,12 @@ function resolveVolume(signal) {
       return units;
     }
   }
-  // Fallback to hardcoded lookup
   const units = getVolume(signal.score, signal.ticker);
   console.log(`[VOLUME] Using fallback getVolume(): score=${signal.score} ticker=${signal.ticker} = ${units} units`);
   return units;
 }
 
-// ── DEDUPLICATION ────────────────────────────────────────────────────────────
+// ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 const seenSignals = new Map();
 function isDuplicate(signalId) {
   const now = Date.now();
@@ -153,7 +114,7 @@ function isDuplicate(signalId) {
   return false;
 }
 
-// ── SUPABASE LOGGING ─────────────────────────────────────────────────────────
+// ── SUPABASE LOGGING ──────────────────────────────────────────────────────────
 async function logSignal(signal, result, status, errorMsg = null, latencyMs = null) {
   try {
     await supabase.from('signal_log').insert({
@@ -201,9 +162,7 @@ async function logAlert(code, severity, message) {
   }
 }
 
-// ── cTRADER PROTOBUF HELPERS ─────────────────────────────────────────────────
-// Minimal Protobuf encoding for the messages we need.
-
+// ── PROTOBUF HELPERS ──────────────────────────────────────────────────────────
 function encodeVarint(value) {
   const bytes = [];
   while (value > 0x7F) {
@@ -225,80 +184,7 @@ function encodeField(fieldNum, wireType, value) {
   throw new Error('Unsupported wire type: ' + wireType);
 }
 
-function encodeLong(value) {
-  // Encode a 64-bit int as two 32-bit parts for Protobuf varint
-  const lo = value >>> 0;
-  const hi = Math.floor(value / 0x100000000) >>> 0;
-  const bytes = [];
-  let combined = lo;
-  for (let i = 0; i < 4; i++) {
-    if (i === 3 && hi > 0) {
-      bytes.push(((combined & 0x0F) | ((hi & 0x07) << 4)) | 0x80);
-      combined = hi >> 3;
-    } else {
-      bytes.push((combined & 0x7F) | (combined > 0x7F || (i === 3 && hi > 0) ? 0x80 : 0));
-      combined >>>= 7;
-    }
-  }
-  // Simpler approach: just use BigInt if available
-  return encodeVarint(value);
-}
-
-// Build ProtoOAApplicationAuthReq  (payloadType = 2100)
-function buildAppAuthReq(clientId, clientSecret) {
-  const body = Buffer.concat([
-    encodeField(1, 2, clientId),
-    encodeField(2, 2, clientSecret),
-  ]);
-  return (2100, body);
-}
-
-// Build ProtoOAAccountAuthReq  (payloadType = 2102)
-function buildAccountAuthReq(accountId, accessToken) {
-  const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 2, accessToken),
-  ]);
-  return (2102, body);
-}
-
-// Build ProtoOASymbolsListReq  (payloadType = 2115)
-function buildSymbolsListReq(accountId) {
-  const body = encodeField(1, 0, accountId);
-  return (2115, body);
-}
-
-// Build ProtoOANewOrderReq  (payloadType = 2106)
-function buildNewOrderReq(accountId, symbolId, tradeSide, volume, relativeStopLoss) {
-  const MARKET_ORDER = 1;
-  const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 0, symbolId),
-    encodeField(3, 0, MARKET_ORDER),   // orderType = MARKET
-    encodeField(4, 0, tradeSide),       // 1 = BUY, 2 = SELL
-    encodeField(5, 0, volume),          // cTrader units
-    encodeField(14, 0, relativeStopLoss), // relative SL in points/pips
-  ]);
-  return (2106, body);
-}
-
-// Build ProtoOAReconcileReq  (payloadType = 2124)
-function buildReconcileReq(accountId) {
-  const body = encodeField(1, 0, accountId);
-  return (2124, body);
-}
-
-// Build ProtoOAClosePositionReq  (payloadType = 2139)
-function buildClosePositionReq(accountId, positionId, volume) {
-  const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 0, positionId),
-    encodeField(3, 0, volume),
-  ]);
-  return (2139, body);
-}
-
-// Build ProtoMessage wrapper
+// ProtoMessage wrapper — field 1 = payloadType (varint), field 2 = payload (bytes)
 function buildProtoMessage(payloadType, payload) {
   const payloadTypeField = encodeField(1, 0, payloadType);
   const payloadField     = encodeField(2, 2, payload);
@@ -308,14 +194,64 @@ function buildProtoMessage(payloadType, payload) {
   return Buffer.concat([lengthBuf, message]);
 }
 
-// ── cTRADER WebSocket / TCP CONNECTION ────────────────────────────────────────
-let socket         = null;
-let isConnected    = false;
-let symbolMap      = {};   // ticker → symbolId
+// ProtoOAApplicationAuthReq  (payloadType 2100)
+function buildAppAuthReq(clientId, clientSecret) {
+  const body = Buffer.concat([
+    encodeField(1, 2, clientId),
+    encodeField(2, 2, clientSecret),
+  ]);
+  return buildProtoMessage(2100, body);
+}
+
+// ProtoOAAccountAuthReq  (payloadType 2102)
+function buildAccountAuthReq(accountId, accessToken) {
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 2, accessToken),
+  ]);
+  return buildProtoMessage(2102, body);
+}
+
+// ProtoOASymbolsListReq  (payloadType 2115)
+function buildSymbolsListReq(accountId) {
+  return buildProtoMessage(2115, encodeField(1, 0, accountId));
+}
+
+// ProtoOANewOrderReq  (payloadType 2106)
+function buildNewOrderReq(accountId, symbolId, tradeSide, volume, relativeStopLoss) {
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 0, symbolId),
+    encodeField(3, 0, 1),                  // orderType = MARKET
+    encodeField(4, 0, tradeSide),           // 1 = BUY, 2 = SELL
+    encodeField(5, 0, volume),
+    encodeField(14, 0, relativeStopLoss),
+  ]);
+  return buildProtoMessage(2106, body);
+}
+
+// ProtoOAReconcileReq  (payloadType 2124)
+function buildReconcileReq(accountId) {
+  return buildProtoMessage(2124, encodeField(1, 0, accountId));
+}
+
+// ProtoOAClosePositionReq  (payloadType 2139)
+function buildClosePositionReq(accountId, positionId, volume) {
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 0, positionId),
+    encodeField(3, 0, volume),
+  ]);
+  return buildProtoMessage(2139, body);
+}
+
+// ── TCP CONNECTION ────────────────────────────────────────────────────────────
+let socket        = null;
+let isConnected   = false;
+let symbolMap     = {};
 let pendingResolve = null;
 let pendingReject  = null;
 let receiveBuffer  = Buffer.alloc(0);
-let tokenExpiryTime = null;
 
 function connectToCTrader() {
   return new Promise((resolve, reject) => {
@@ -396,27 +332,29 @@ function processReceiveBuffer() {
   }
 }
 
+// Parse incoming ProtoMessage — field 1 = payloadType, field 2 = payload
 function handleIncomingMessage(buf) {
-  // Extract payloadType (field 3, varint) and payload (field 5, bytes)
   let payloadType = null;
   let payload     = null;
   let pos = 0;
+
   while (pos < buf.length) {
     const tagByte  = buf[pos++];
     const fieldNum = tagByte >> 3;
     const wireType = tagByte & 0x07;
+
     if (wireType === 0) {
       let val = 0, shift = 0;
-      while (true) {
+      while (pos < buf.length) {
         const b = buf[pos++];
         val |= (b & 0x7F) << shift;
         if (!(b & 0x80)) break;
         shift += 7;
       }
-      if (fieldNum === 3) payloadType = val;
+      if (fieldNum === 1) payloadType = val;   // field 1 = payloadType
     } else if (wireType === 2) {
       let len = 0, shift = 0;
-      while (true) {
+      while (pos < buf.length) {
         const b = buf[pos++];
         len |= (b & 0x7F) << shift;
         if (!(b & 0x80)) break;
@@ -424,9 +362,9 @@ function handleIncomingMessage(buf) {
       }
       const data = buf.slice(pos, pos + len);
       pos += len;
-      if (fieldNum === 5) payload = data;
+      if (fieldNum === 2) payload = data;      // field 2 = payload
     } else {
-      break; // unknown wire type — stop
+      break;
     }
   }
 
@@ -440,12 +378,7 @@ function handleIncomingMessage(buf) {
 function sendAndWait(msg, expectedType) {
   return new Promise((resolve, reject) => {
     pendingResolve = (resp) => {
-      if (resp.payloadType === expectedType || resp.payloadType === 50) {
-        resolve(resp);
-      } else {
-        // Accept any response — let caller decide
-        resolve(resp);
-      }
+      resolve(resp);
     };
     pendingReject = reject;
     socket.write(msg);
@@ -462,7 +395,6 @@ function sendAndWait(msg, expectedType) {
 async function loadSymbols() {
   const resp = await sendAndWait(buildSymbolsListReq(ACCOUNT_ID), 2116);
   if (!resp.payload) return;
-  // Parse symbols list — field 2 repeated: {field1=symbolId, field3=name}
   const buf = resp.payload;
   let pos = 0;
   while (pos < buf.length) {
@@ -479,7 +411,6 @@ async function loadSymbols() {
         shift += 7;
       }
       if (fieldNum === 2) {
-        // Parse each symbol entry
         const symBuf = buf.slice(pos, pos + len);
         const sym    = parseSymbolEntry(symBuf);
         if (sym.id && sym.name) symbolMap[sym.name] = sym.id;
@@ -522,7 +453,7 @@ function parseSymbolEntry(buf) {
   return { id, name };
 }
 
-// ── UPSTASH QUEUE WASHDOWN (on startup) ──────────────────────────────────────
+// ── UPSTASH QUEUE WASHDOWN ────────────────────────────────────────────────────
 async function washdownQueue() {
   try {
     const res = await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/llen/hawk:signals`, {
@@ -544,26 +475,22 @@ async function washdownQueue() {
   }
 }
 
-// ── SIGNAL PROCESSING ────────────────────────────────────────────────────────
+// ── SIGNAL PROCESSING ─────────────────────────────────────────────────────────
 async function processSignal(signal, receivedAt) {
-  const startMs    = Date.now();
-  const latencyMs  = startMs - receivedAt;
+  const latencyMs = Date.now() - receivedAt;
 
-  // Stale signal check (> 5 seconds old)
   if (latencyMs > 5000) {
-    console.warn(`[EXPIRED] Signal ${signal.ticker} ${signal.action} age=${latencyMs}ms — skipped`);
-    await logSignal(signal, null, 'EXPIRED', `Signal age ${latencyMs}ms exceeds 5000ms limit`, latencyMs);
+    console.warn(`[EXPIRED] ${signal.ticker} ${signal.action} age=${latencyMs}ms — skipped`);
+    await logSignal(signal, null, 'EXPIRED', `Signal age ${latencyMs}ms exceeds 5000ms`, latencyMs);
     return;
   }
 
-  // Deduplication
   const sigId = signal.signal_id || signal.timestamp;
   if (isDuplicate(sigId)) {
     console.warn(`[DUPLICATE] ${signal.ticker} ${signal.action} — skipped`);
     return;
   }
 
-  // Symbol lookup
   const ctSymbol = SYMBOL_MAP[signal.ticker];
   if (!ctSymbol) {
     console.error(`[SYMBOL ERROR] No mapping for ticker: ${signal.ticker}`);
@@ -579,7 +506,7 @@ async function processSignal(signal, receivedAt) {
 
   const action  = signal.action;
   const isEntry = action === 'LONG' || action === 'SHORT';
-  const isExit  = action === 'LONG_EXIT' || action === 'SHORT_EXIT' ||
+  const isExit  = action === 'LONG_EXIT'  || action === 'SHORT_EXIT' ||
                   action === 'LONG_STOP'  || action === 'SHORT_STOP';
 
   console.log(`[SIGNAL] ${signal.ticker} ${action} score=${signal.score} age=${latencyMs}ms`);
@@ -591,13 +518,9 @@ async function processSignal(signal, receivedAt) {
   }
 
   try {
-    if (isEntry) {
-      await placeEntry(signal, symbolId, latencyMs);
-    } else if (isExit) {
-      await placeExit(signal, symbolId, latencyMs);
-    } else {
-      console.warn(`[UNKNOWN ACTION] ${action} — skipped`);
-    }
+    if (isEntry)     await placeEntry(signal, symbolId, latencyMs);
+    else if (isExit) await placeExit(signal, symbolId, latencyMs);
+    else             console.warn(`[UNKNOWN ACTION] ${action} — skipped`);
   } catch (err) {
     console.error(`[EXECUTE ERROR] ${signal.ticker} ${action}:`, err.message);
     await logSignal(signal, null, 'FAILED', err.message, latencyMs);
@@ -605,43 +528,34 @@ async function processSignal(signal, receivedAt) {
 }
 
 async function placeEntry(signal, symbolId, latencyMs) {
-  const volume   = resolveVolume(signal);
+  const volume = resolveVolume(signal);
 
   if (volume === 0) {
-    console.warn(`[ZERO VOLUME] ${signal.ticker} score=${signal.score} — order skipped (0 units). Check lot size configuration.`);
-    await logSignal(signal, null, 'SKIPPED', 'Zero volume — no order placed. Review lot size for this score/ticker combination.', latencyMs);
+    console.warn(`[ZERO VOLUME] ${signal.ticker} score=${signal.score} — order skipped`);
+    await logSignal(signal, null, 'SKIPPED', 'Zero volume — review lot size configuration', latencyMs);
     return;
   }
 
-  const isLong     = signal.action === 'LONG';
-  const tradeSide  = isLong ? 1 : 2;
+  const tradeSide  = signal.action === 'LONG' ? 1 : 2;
   const atr        = parseFloat(signal.atr) || 0;
-  // relativeStopLoss in cTrader = points (price × 100 for most instruments)
-  // ATR is already in price units. Multiply by 2 for 2× ATR stop.
   const stopPoints = Math.round(atr * 2 * 100);
 
-  console.log(`[ORDER] Placing ${signal.action} | ${signal.ticker} | ${volume} units | SL: ${stopPoints} pts`);
+  console.log(`[ORDER] ${signal.action} | ${signal.ticker} | ${volume} units | SL: ${stopPoints} pts`);
 
-  const orderMsg = buildNewOrderReq(ACCOUNT_ID, symbolId, tradeSide, volume, stopPoints);
-  const resp     = await sendAndWait(orderMsg, 2108);
+  const orderMsg  = buildNewOrderReq(ACCOUNT_ID, symbolId, tradeSide, volume, stopPoints);
+  const resp      = await sendAndWait(orderMsg, 2108);
 
-  // Confirm via reconcile 1.5s later
   await new Promise(r => setTimeout(r, 1500));
-  const reconMsg  = buildReconcileReq(ACCOUNT_ID);
-  const reconResp = await sendAndWait(reconMsg, 2125);
+  await sendAndWait(buildReconcileReq(ACCOUNT_ID), 2125);
 
-  const totalLatency = Date.now() - (Date.now() - latencyMs);
   console.log(`[EXECUTED] ${signal.ticker} ${signal.action} | ${volume} units`);
   await logSignal(signal, { resp: resp.payloadType }, 'EXECUTED', null, latencyMs);
 }
 
 async function placeExit(signal, symbolId, latencyMs) {
-  // Reconcile to find open position for this symbol
-  const reconMsg  = buildReconcileReq(ACCOUNT_ID);
-  const reconResp = await sendAndWait(reconMsg, 2125);
+  const reconResp = await sendAndWait(buildReconcileReq(ACCOUNT_ID), 2125);
+  const position  = findPosition(reconResp.payload, symbolId);
 
-  // Parse positions from reconcile response
-  const position = findPosition(reconResp.payload, symbolId);
   if (!position) {
     console.warn(`[EXIT] No open position found for ${signal.ticker} — skipped`);
     await logSignal(signal, null, 'SKIPPED', `No open position for ${signal.ticker}`, latencyMs);
@@ -649,8 +563,7 @@ async function placeExit(signal, symbolId, latencyMs) {
   }
 
   console.log(`[EXIT] Closing position ${position.id} | ${signal.ticker} | ${position.volume} units`);
-  const closeMsg = buildClosePositionReq(ACCOUNT_ID, position.id, position.volume);
-  const closeResp = await sendAndWait(closeMsg, 2140);
+  const closeResp = await sendAndWait(buildClosePositionReq(ACCOUNT_ID, position.id, position.volume), 2140);
 
   console.log(`[CLOSED] ${signal.ticker} ${signal.action}`);
   await logSignal(signal, { resp: closeResp.payloadType }, 'EXECUTED', null, latencyMs);
@@ -658,11 +571,8 @@ async function placeExit(signal, symbolId, latencyMs) {
 
 function findPosition(buf, targetSymbolId) {
   if (!buf) return null;
-  // ProtoOAReconcileRes: field 2 = position[] {field1=positionId, field2=tradeData{symbolId,volume}}
-  // Simplified parse — extract first position matching symbolId
   let pos = 0;
   while (pos < buf.length) {
-    if (pos >= buf.length) break;
     const tagByte  = buf[pos++];
     const fieldNum = tagByte >> 3;
     const wireType = tagByte & 0x07;
@@ -675,8 +585,8 @@ function findPosition(buf, targetSymbolId) {
         shift += 7;
       }
       if (fieldNum === 2) {
-        const posEntry = parsePositionEntry(buf.slice(pos, pos + len), targetSymbolId);
-        if (posEntry) return posEntry;
+        const entry = parsePositionEntry(buf.slice(pos, pos + len), targetSymbolId);
+        if (entry) return entry;
       }
       pos += len;
     } else if (wireType === 0) {
@@ -687,8 +597,7 @@ function findPosition(buf, targetSymbolId) {
 }
 
 function parsePositionEntry(buf, targetSymbolId) {
-  let positionId = null, symbolId = null, volume = null;
-  let pos = 0;
+  let positionId = null, symbolId = null, volume = null, pos = 0;
   while (pos < buf.length) {
     const tagByte  = buf[pos++];
     const fieldNum = tagByte >> 3;
@@ -711,10 +620,9 @@ function parsePositionEntry(buf, targetSymbolId) {
         shift += 7;
       }
       if (fieldNum === 2) {
-        // tradeData
-        const tradeData = parseTradeData(buf.slice(pos, pos + len));
-        symbolId = tradeData.symbolId;
-        volume   = tradeData.volume;
+        const td = parseTradeData(buf.slice(pos, pos + len));
+        symbolId = td.symbolId;
+        volume   = td.volume;
       }
       pos += len;
     } else break;
@@ -753,14 +661,13 @@ function parseTradeData(buf) {
   return { symbolId, volume };
 }
 
-// ── HTTP SERVER (primary signal path from Cloudflare Worker) ─────────────────
+// ── HTTP SERVER ───────────────────────────────────────────────────────────────
 function startHttpServer() {
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/signal') {
       res.writeHead(404); res.end(); return;
     }
-    const secret = req.headers['x-internal-secret'];
-    if (secret !== INTERNAL_SECRET) {
+    if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
       res.writeHead(401); res.end('Unauthorized'); return;
     }
     let body = '';
@@ -777,15 +684,13 @@ function startHttpServer() {
       }
     });
   });
-  server.listen(PORT, () => {
-    console.log(`HTTP server listening on port ${PORT}`);
-  });
+  server.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
 }
 
-// ── MAIN ─────────────────────────────────────────────────────────────────────
+// ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`╔════════════════════════════════════════════╗`);
-  console.log(`║  HAWK Execution Engine v2.7 STARTED        ║`);
+  console.log(`║  HAWK Execution Engine v2.8 STARTED        ║`);
   console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
   console.log(`╚════════════════════════════════════════════╝`);
 
@@ -793,7 +698,6 @@ async function main() {
   await connectToCTrader();
   startHttpServer();
 
-  // Heartbeat every 60 seconds
   setInterval(async () => {
     const daysLeft = tokenExpiryTime
       ? Math.floor((tokenExpiryTime - Date.now()) / 86400000)
