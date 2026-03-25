@@ -18,7 +18,7 @@ const CTRADER_SECRET       = process.env.CTRADER_CLIENT_SECRET;
 const CTRADER_REFRESH      = process.env.CTRADER_REFRESH_TOKEN;
 const ACCOUNT_ID           = parseInt(process.env.CTRADER_ACCOUNT_ID || '46630089');
 const SUPABASE_URL         = process.env.SUPABASE_URL;
-const SUPABASE_KEY         = process.env.SUPABASE_KEY;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const INTERNAL_SECRET      = process.env.INTERNAL_SECRET;
 const IS_PAPER             = (process.env.IS_PAPER || 'true') !== 'false';
 const PORT                 = parseInt(process.env.PORT || '3000');
