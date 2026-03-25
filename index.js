@@ -441,7 +441,7 @@ async function loadSymbols() {
         if (!(b & 0x80)) break;
         shift += 7;
       }
-      if (fieldNum === 2) {
+      if (fieldNum === 3) {
         const symBuf = buf.slice(pos, pos + len);
         const sym    = parseSymbolEntry(symBuf);
         if (sym.id && sym.name) symbolMap[sym.name] = sym.id;
