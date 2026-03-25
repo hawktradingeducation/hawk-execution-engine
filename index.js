@@ -9,7 +9,7 @@
 
 'use strict';
 const { createClient } = require('@supabase/supabase-js');
-const net              = require('net');
+const tls              = require('tls');
 const http             = require('http');
 
 // ── ENVIRONMENT ───────────────────────────────────────────────────────────────
@@ -256,9 +256,7 @@ let receiveBuffer  = Buffer.alloc(0);
 function connectToCTrader() {
   return new Promise((resolve, reject) => {
     console.log(`Connecting to cTrader (${CT_HOST}:5035)...`);
-    socket = new net.Socket();
-
-    socket.connect(5035, CT_HOST, async () => {
+    socket = tls.connect(5035, CT_HOST, { rejectUnauthorized: true }, async () => {
       console.log('TCP connected. Authenticating application...');
       try {
         const token = await getAccessToken();
