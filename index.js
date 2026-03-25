@@ -425,14 +425,18 @@ function sendAndWait(msg, expectedType) {
 
 async function loadSymbols() {
   const resp = await sendAndWait(buildSymbolsListReq(ACCOUNT_ID), 2116);
-  if (!resp.payload) return;
+  console.log(`[SYMBOLS DEBUG] payloadType=${resp.payloadType} payloadBytes=${resp.payload ? resp.payload.length : 'null'}`);
+  if (!resp.payload) { console.log('[SYMBOLS DEBUG] payload is null — no symbols to parse'); return; }
+  console.log(`[SYMBOLS DEBUG] first 60 bytes: ${resp.payload.slice(0, 60).toString('hex')}`);
   const buf = resp.payload;
   let pos = 0;
+  let entryCount = 0;
   while (pos < buf.length) {
     if (pos >= buf.length) break;
     const tagByte  = buf[pos++];
     const fieldNum = tagByte >> 3;
     const wireType = tagByte & 0x07;
+    console.log(`[SYMBOLS DEBUG] pos=${pos-1} fieldNum=${fieldNum} wireType=${wireType}`);
     if (wireType === 2) {
       let len = 0, shift = 0;
       while (pos < buf.length) {
@@ -444,12 +448,23 @@ async function loadSymbols() {
       if (fieldNum === 3) {
         const symBuf = buf.slice(pos, pos + len);
         const sym    = parseSymbolEntry(symBuf);
-        if (sym.id && sym.name) symbolMap[sym.name] = sym.id;
+        if (entryCount < 3) console.log(`[SYMBOLS DEBUG] entry: id=${sym.id} name=${sym.name}`);
+        if (sym.id && sym.name) { symbolMap[sym.name] = sym.id; entryCount++; }
       }
       pos += len;
     } else if (wireType === 0) {
-      while (pos < buf.length && (buf[pos++] & 0x80));
-    } else break;
+      let val = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        val |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      console.log(`[SYMBOLS DEBUG] varint field ${fieldNum} = ${val}`);
+    } else {
+      console.log(`[SYMBOLS DEBUG] unexpected wireType=${wireType} at pos=${pos-1} — stopping`);
+      break;
+    }
   }
 }
 
