@@ -256,13 +256,14 @@ async function connectToCTrader() {
     console.log(`=== ENGINE READY | Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'} ===`);
     await logAlert('ENGINE_READY', 'INFO', `Engine v2.12 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
 
-  } catch (err) {
-    console.error('cTrader connection failed:', err.message);
+} catch (err) {
+    const errMsg = err?.message || JSON.stringify(err) || String(err);
+    console.error('cTrader connection failed:', errMsg);
+    console.error('Full error object:', JSON.stringify(err));
     reconnecting = false;
-    await logAlert('CONNECTION_FAILED', 'CRITICAL', err.message);
+    await logAlert('CONNECTION_FAILED', 'CRITICAL', errMsg);
     setTimeout(connectToCTrader, 5000);
   }
-}
 
 // ── PIPELINE WASHDOWN ─────────────────────────────────────────────────────────
 async function washdownQueue() {
