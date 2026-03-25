@@ -1,9 +1,13 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║  HAWK EXECUTION ENGINE  —  index.js  v2.10                      ║
-// ║  Changes vs v2.9:                                                ║
-// ║  - parseSymbolEntry: symbolName corrected to field 2 (was 3)    ║
-// ║  - TLS heartbeat added: ProtoHeartbeatEvent every 25s           ║
-// ║    prevents demo server dropping idle connections                ║
+// ║  HAWK EXECUTION ENGINE  —  index.js  v2.11                      ║
+// ║  Changes vs v2.10:                                               ║
+// ║  - sendAndWait now only resolves on the EXPECTED payloadType     ║
+// ║    Stray server pushes (e.g. 2142 after account auth) are        ║
+// ║    logged and discarded rather than falsely resolving            ║
+// ║  - handleIncomingMessage no longer clears pendingResolve —       ║
+// ║    the callback decides whether to resolve/reject or keep        ║
+// ║    waiting                                                        ║
+// ║  - loadSymbols debug logging removed (was v2.10 diagnostic)     ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 'use strict';
@@ -279,17 +283,11 @@ function connectToCTrader() {
         // 1. App auth — expect 2101
         const appResp = await sendAndWait(buildAppAuthReq(CTRADER_CLIENT_ID, CTRADER_SECRET), 2101);
         console.log(`App auth response payloadType: ${appResp.payloadType}`);
-        if (appResp.payloadType !== 2101) {
-          throw new Error(`App auth failed — server returned payloadType ${appResp.payloadType}`);
-        }
         console.log('Application authenticated');
 
         // 2. Account auth — expect 2103
         const acctResp = await sendAndWait(buildAccountAuthReq(ACCOUNT_ID, token), 2103);
         console.log(`Account auth response payloadType: ${acctResp.payloadType}`);
-        if (acctResp.payloadType !== 2103) {
-          throw new Error(`Account auth failed — server returned payloadType ${acctResp.payloadType}`);
-        }
         console.log(`Account authenticated: ${ACCOUNT_ID}`);
 
         // 3. Load symbols
@@ -366,6 +364,8 @@ function processReceiveBuffer() {
 }
 
 // Outer ProtoMessage: field 1 = payloadType (varint), field 2 = payload (bytes)
+// NOTE: does NOT clear pendingResolve — the sendAndWait callback decides
+// whether to resolve/reject (and clears itself) or keep waiting.
 function handleIncomingMessage(buf) {
   let payloadType = null;
   let payload     = null;
@@ -401,16 +401,34 @@ function handleIncomingMessage(buf) {
     }
   }
 
-  if (pendingResolve && payloadType !== null) {
+  if (payloadType !== null && pendingResolve) {
     pendingResolve({ payloadType, payload });
-    pendingResolve = null;
-    pendingReject  = null;
+    // pendingResolve clears itself if it decides to resolve/reject
   }
 }
 
+// sendAndWait: only resolves on the EXPECTED payloadType.
+// Stray server messages (e.g. unsolicited 2142 push after account auth)
+// are logged and discarded — pendingResolve stays active until the
+// correct response arrives or the timeout fires.
 function sendAndWait(msg, expectedType) {
   return new Promise((resolve, reject) => {
-    pendingResolve = (resp) => { resolve(resp); };
+    const handler = ({ payloadType, payload }) => {
+      if (payloadType === expectedType) {
+        pendingResolve = null;
+        pendingReject  = null;
+        resolve({ payloadType, payload });
+      } else if (payloadType === 2142) {
+        // Explicit server error
+        pendingResolve = null;
+        pendingReject  = null;
+        reject(new Error(`Server returned error (2142) while waiting for ${expectedType}`));
+      } else {
+        // Stray / unsolicited message — log and keep waiting
+        console.log(`[WARN] Received unexpected payloadType ${payloadType} while waiting for ${expectedType} — discarding`);
+      }
+    };
+    pendingResolve = handler;
     pendingReject  = reject;
     socket.write(msg);
     setTimeout(() => {
@@ -425,18 +443,14 @@ function sendAndWait(msg, expectedType) {
 
 async function loadSymbols() {
   const resp = await sendAndWait(buildSymbolsListReq(ACCOUNT_ID), 2116);
-  console.log(`[SYMBOLS DEBUG] payloadType=${resp.payloadType} payloadBytes=${resp.payload ? resp.payload.length : 'null'}`);
-  if (!resp.payload) { console.log('[SYMBOLS DEBUG] payload is null — no symbols to parse'); return; }
-  console.log(`[SYMBOLS DEBUG] first 60 bytes: ${resp.payload.slice(0, 60).toString('hex')}`);
+  if (!resp.payload) return;
   const buf = resp.payload;
   let pos = 0;
-  let entryCount = 0;
   while (pos < buf.length) {
     if (pos >= buf.length) break;
     const tagByte  = buf[pos++];
     const fieldNum = tagByte >> 3;
     const wireType = tagByte & 0x07;
-    console.log(`[SYMBOLS DEBUG] pos=${pos-1} fieldNum=${fieldNum} wireType=${wireType}`);
     if (wireType === 2) {
       let len = 0, shift = 0;
       while (pos < buf.length) {
@@ -448,8 +462,7 @@ async function loadSymbols() {
       if (fieldNum === 3) {
         const symBuf = buf.slice(pos, pos + len);
         const sym    = parseSymbolEntry(symBuf);
-        if (entryCount < 3) console.log(`[SYMBOLS DEBUG] entry: id=${sym.id} name=${sym.name}`);
-        if (sym.id && sym.name) { symbolMap[sym.name] = sym.id; entryCount++; }
+        if (sym.id && sym.name) symbolMap[sym.name] = sym.id;
       }
       pos += len;
     } else if (wireType === 0) {
@@ -460,11 +473,7 @@ async function loadSymbols() {
         if (!(b & 0x80)) break;
         shift += 7;
       }
-      console.log(`[SYMBOLS DEBUG] varint field ${fieldNum} = ${val}`);
-    } else {
-      console.log(`[SYMBOLS DEBUG] unexpected wireType=${wireType} at pos=${pos-1} — stopping`);
-      break;
-    }
+    } else break;
   }
 }
 
@@ -494,7 +503,7 @@ function parseSymbolEntry(buf) {
       }
       const str = buf.slice(pos, pos + len).toString('utf8');
       pos += len;
-      if (fieldNum === 2) name = str;   // field 2 = symbolName (was incorrectly field 3)
+      if (fieldNum === 2) name = str;
     } else break;
   }
   return { id, name };
@@ -553,8 +562,8 @@ async function processSignal(signal, receivedAt) {
 
   const action  = signal.action;
   const isEntry = action === 'LONG' || action === 'SHORT';
-  const isExit  = action === 'LONG_EXIT'      || action === 'SHORT_EXIT' ||
-                  action === 'LONG_STOP'       || action === 'SHORT_STOP';
+  const isExit  = action === 'LONG_EXIT'  || action === 'SHORT_EXIT' ||
+                  action === 'LONG_STOP'  || action === 'SHORT_STOP';
 
   console.log(`[SIGNAL] ${signal.ticker} ${action} score=${signal.score} age=${latencyMs}ms`);
 
@@ -739,7 +748,7 @@ function startHttpServer() {
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`╔════════════════════════════════════════════╗`);
-  console.log(`║  HAWK Execution Engine v2.10 STARTED       ║`);
+  console.log(`║  HAWK Execution Engine v2.11 STARTED       ║`);
   console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
   console.log(`╚════════════════════════════════════════════╝`);
 
