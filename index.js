@@ -250,7 +250,7 @@ function buildAppAuthReq(clientId, clientSecret) {
     encodeField(1, 2, clientId),
     encodeField(2, 2, clientSecret),
   ]);
-  return buildProtoMessage(2100, body);
+  return (2100, body);
 }
 
 // Build ProtoOAAccountAuthReq  (payloadType = 2102)
@@ -259,13 +259,13 @@ function buildAccountAuthReq(accountId, accessToken) {
     encodeField(1, 0, accountId),
     encodeField(2, 2, accessToken),
   ]);
-  return buildProtoMessage(2102, body);
+  return (2102, body);
 }
 
 // Build ProtoOASymbolsListReq  (payloadType = 2115)
 function buildSymbolsListReq(accountId) {
   const body = encodeField(1, 0, accountId);
-  return buildProtoMessage(2115, body);
+  return (2115, body);
 }
 
 // Build ProtoOANewOrderReq  (payloadType = 2106)
@@ -279,13 +279,13 @@ function buildNewOrderReq(accountId, symbolId, tradeSide, volume, relativeStopLo
     encodeField(5, 0, volume),          // cTrader units
     encodeField(14, 0, relativeStopLoss), // relative SL in points/pips
   ]);
-  return buildProtoMessage(2106, body);
+  return (2106, body);
 }
 
 // Build ProtoOAReconcileReq  (payloadType = 2124)
 function buildReconcileReq(accountId) {
   const body = encodeField(1, 0, accountId);
-  return buildProtoMessage(2124, body);
+  return (2124, body);
 }
 
 // Build ProtoOAClosePositionReq  (payloadType = 2139)
@@ -295,13 +295,13 @@ function buildClosePositionReq(accountId, positionId, volume) {
     encodeField(2, 0, positionId),
     encodeField(3, 0, volume),
   ]);
-  return buildProtoMessage(2139, body);
+  return (2139, body);
 }
 
 // Build ProtoMessage wrapper
 function buildProtoMessage(payloadType, payload) {
-  const payloadTypeField = encodeField(3, 0, payloadType);
-  const payloadField     = encodeField(5, 2, payload);
+  const payloadTypeField = encodeField(1, 0, payloadType);
+  const payloadField     = encodeField(2, 2, payload);
   const message          = Buffer.concat([payloadTypeField, payloadField]);
   const lengthBuf        = Buffer.alloc(4);
   lengthBuf.writeUInt32BE(message.length, 0);
