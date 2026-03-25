@@ -1,11 +1,9 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║  HAWK EXECUTION ENGINE  —  index.js  v2.9                       ║
-// ║  Changes vs v2.8:                                                ║
-// ║  - Inner message payloads now include payloadType as field 1     ║
-// ║    per official Spotware proto definition (all other fields +1)  ║
-// ║  - relativeStopLoss corrected to field 15 (was 14)              ║
-// ║  - closePositionReq volume corrected to field 4 (was 3)         ║
-// ║  - Auth steps now verify response payloadType before continuing  ║
+// ║  HAWK EXECUTION ENGINE  —  index.js  v2.10                      ║
+// ║  Changes vs v2.9:                                                ║
+// ║  - parseSymbolEntry: symbolName corrected to field 2 (was 3)    ║
+// ║  - TLS heartbeat added: ProtoHeartbeatEvent every 25s           ║
+// ║    prevents demo server dropping idle connections                ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 'use strict';
@@ -267,6 +265,7 @@ let symbolMap      = {};
 let pendingResolve = null;
 let pendingReject  = null;
 let receiveBuffer  = Buffer.alloc(0);
+let heartbeatInterval = null;
 
 function connectToCTrader() {
   return new Promise((resolve, reject) => {
@@ -297,6 +296,16 @@ function connectToCTrader() {
         await loadSymbols();
         console.log(`Symbols loaded: ${Object.keys(symbolMap).length}`);
 
+        // 4. Start heartbeat — keeps TLS connection alive on demo server
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        heartbeatInterval = setInterval(() => {
+          if (socket && !socket.destroyed) {
+            socket.write(buildProtoMessage(51, Buffer.alloc(0)));
+          } else {
+            clearInterval(heartbeatInterval);
+          }
+        }, 25000);
+
         isConnected = true;
         console.log(`=== ENGINE READY | Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'} ===`);
         await logHealth('RUNNING');
@@ -315,6 +324,7 @@ function connectToCTrader() {
     socket.on('error', async (err) => {
       console.error('[TLS ERROR]', err.message);
       isConnected = false;
+      if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
       await logHealth('DISCONNECTED');
       scheduleReconnect();
     });
@@ -322,6 +332,7 @@ function connectToCTrader() {
     socket.on('close', async () => {
       console.warn('[TLS CLOSED] Scheduling reconnect...');
       isConnected = false;
+      if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
       await logHealth('DISCONNECTED');
       scheduleReconnect();
     });
@@ -442,6 +453,7 @@ async function loadSymbols() {
   }
 }
 
+// ProtoOALightSymbol: field 1 = symbolId, field 2 = symbolName
 function parseSymbolEntry(buf) {
   let id = null, name = null, pos = 0;
   while (pos < buf.length) {
@@ -467,7 +479,7 @@ function parseSymbolEntry(buf) {
       }
       const str = buf.slice(pos, pos + len).toString('utf8');
       pos += len;
-      if (fieldNum === 3) name = str;
+      if (fieldNum === 2) name = str;   // field 2 = symbolName (was incorrectly field 3)
     } else break;
   }
   return { id, name };
@@ -526,8 +538,8 @@ async function processSignal(signal, receivedAt) {
 
   const action  = signal.action;
   const isEntry = action === 'LONG' || action === 'SHORT';
-  const isExit  = action === 'LONG_EXIT'  || action === 'SHORT_EXIT' ||
-                  action === 'LONG_STOP'  || action === 'SHORT_STOP';
+  const isExit  = action === 'LONG_EXIT'      || action === 'SHORT_EXIT' ||
+                  action === 'LONG_STOP'       || action === 'SHORT_STOP';
 
   console.log(`[SIGNAL] ${signal.ticker} ${action} score=${signal.score} age=${latencyMs}ms`);
 
@@ -712,7 +724,7 @@ function startHttpServer() {
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`╔════════════════════════════════════════════╗`);
-  console.log(`║  HAWK Execution Engine v2.9 STARTED        ║`);
+  console.log(`║  HAWK Execution Engine v2.10 STARTED       ║`);
   console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
   console.log(`╚════════════════════════════════════════════╝`);
 
