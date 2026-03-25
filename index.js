@@ -25,7 +25,7 @@ const PORT                 = parseInt(process.env.PORT || '3000');
 
 const CT_HOST = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ── TOKEN MANAGEMENT ─────────────────────────────────────────────────────────
 // We refresh automatically 30 seconds before expiry so execution is never
