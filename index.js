@@ -1,15 +1,4 @@
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  HAWK EXECUTION ENGINE  —  index.js  v2.12                      ║
-// ║  Based on v2.6 (working). Changes:                               ║
-// ║  - Reverted to @reiryoku/ctrader-layer (dropped hand-rolled     ║
-// ║    Protobuf which caused all symbol loading failures v2.7-2.11) ║
-// ║  - SYMBOL_MAP expanded: GER40, AUS200, ETHUSD, XAGUSD,          ║
-// ║    SPOTBRENT added                                               ║
-// ║  - getVolume() now per-ticker (was XAUUSD-only flat rate)        ║
-// ║  - LONG_MKT_CLOSE / SHORT_MKT_CLOSE added to exit handler       ║
-// ╚══════════════════════════════════════════════════════════════════╝
-
-'use strict'; 
+'use strict';
 
 const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
@@ -17,7 +6,6 @@ const express               = require('express');
 
 console.log('=== HAWK ENGINE v2.12 STARTING ===');
 
-// ── ENV VARS ──────────────────────────────────────────────────────────────────
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
 const SUPABASE_URL    = process.env.SUPABASE_URL;
@@ -35,7 +23,6 @@ console.log('IS_PAPER:', IS_PAPER, '| HOST:', HOST, '| ACCOUNT_ID:', ACCOUNT_ID)
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
 let currentAccessToken = null;
 let tokenExpiryTime    = null;
 
@@ -58,14 +45,13 @@ async function refreshAccessToken() {
   const daysLeft     = Math.floor(data.expires_in / 86400);
   console.log('Access token refreshed. Expires in', daysLeft, 'days');
   await logHealth('RUNNING', daysLeft);
-  if (daysLeft < 7) await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
-    `cTrader access token expires in ${daysLeft} days.`);
+  if (daysLeft < 7) {
+    await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
+      `cTrader access token expires in ${daysLeft} days.`);
+  }
   return currentAccessToken;
 }
 
-// ── SYMBOL MAP ────────────────────────────────────────────────────────────────
-// TradingView ticker → cTrader symbol name
-// Verify exact names in your Pepperstone paper account if any fail to resolve.
 const SYMBOL_MAP = {
   'XAUUSD':    'XAUUSD',
   'BTCUSD':    'BTCUSD',
@@ -77,12 +63,8 @@ const SYMBOL_MAP = {
   'SPOTBRENT': 'SPOTBRENT',
 };
 
-let symbolIdMap = {};  // symbolIdMap[ctName] = symbolId
+let symbolIdMap = {};
 
-// ── VOLUME ────────────────────────────────────────────────────────────────────
-// Primary path: lot_size from Pine Script payload (lot_size × 100 = units).
-// Fallback: per-ticker hardcoded lookup.
-// ⚠ NAS100 score 7 = 0 units — will be rejected by cTrader. Verify intentional.
 function getVolume(score, ticker) {
   const s = parseInt(score);
   switch (ticker) {
@@ -95,7 +77,7 @@ function getVolume(score, ticker) {
     case 'AUS200':    return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     case 'SPOTBRENT': return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     default:
-      console.warn(`[VOLUME] No rule for ${ticker} — defaulting to 1`);
+      console.warn('[VOLUME] No rule for', ticker, '— defaulting to 1');
       return 1;
   }
 }
@@ -105,16 +87,15 @@ function resolveVolume(signal) {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
       const units = Math.round(lots * 100);
-      console.log(`[VOLUME] payload lot_size: ${lots} lots = ${units} units`);
+      console.log('[VOLUME] payload lot_size:', lots, 'lots =', units, 'units');
       return units;
     }
   }
   const units = getVolume(signal.score, signal.ticker);
-  console.log(`[VOLUME] fallback: score=${signal.score} ticker=${signal.ticker} = ${units} units`);
+  console.log('[VOLUME] fallback: score=' + signal.score + ' ticker=' + signal.ticker + ' = ' + units + ' units');
   return units;
 }
 
-// ── SIGNAL VALIDITY ───────────────────────────────────────────────────────────
 const SIGNAL_TTL_MS = 5000;
 
 function isExpired(signal) {
@@ -129,7 +110,6 @@ function getLatencyMs(signal) {
   return Date.now() - receivedAt;
 }
 
-// ── DEDUPLICATION ─────────────────────────────────────────────────────────────
 const seenSignals = new Map();
 function isDuplicate(signalId) {
   const now = Date.now();
@@ -141,8 +121,7 @@ function isDuplicate(signalId) {
   return false;
 }
 
-// ── SUPABASE LOGGING ──────────────────────────────────────────────────────────
-async function logSignal(signal, result, status, errorMsg = null, latencyMs = null) {
+async function logSignal(signal, result, status, errorMsg, latencyMs) {
   try {
     const { data, error } = await supabase.from('signal_log').insert({
       signal_id:     signal.signal_id,
@@ -153,35 +132,37 @@ async function logSignal(signal, result, status, errorMsg = null, latencyMs = nu
       atr:           parseFloat(signal.atr),
       close_price:   parseFloat(signal.close),
       status,
-      error_message: errorMsg,
+      error_message: errorMsg || null,
       api_response:  result ? JSON.stringify(result) : null,
       signal_time:   new Date(parseInt(signal.timestamp)).toISOString(),
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER,
-      latency_ms:    latencyMs,
+      latency_ms:    latencyMs || null,
     }).select('id').single();
     if (error) throw error;
-    console.log('Logged:', status, latencyMs ? `(${latencyMs}ms)` : '', '| dbId:', data?.id);
-    return data?.id || null;
+    console.log('Logged:', status, latencyMs ? '(' + latencyMs + 'ms)' : '', '| dbId:', data && data.id);
+    return data && data.id || null;
   } catch (e) {
     console.error('Supabase signal_log error:', e.message);
     return null;
   }
 }
 
-async function logHealth(status, tokenDaysLeft = null) {
+async function logHealth(status, tokenDaysLeft) {
   try {
     await supabase.from('health_log').insert({
       status,
-      token_days_left: tokenDaysLeft,
+      token_days_left: tokenDaysLeft || null,
       checked_at:      new Date().toISOString(),
       is_paper:        IS_PAPER,
     });
-  } catch (e) { console.error('Supabase health_log error:', e.message); }
+  } catch (e) {
+    console.error('Supabase health_log error:', e.message);
+  }
 }
 
 async function logAlert(alertType, severity, message) {
-  console.log(`ALERT [${severity}] ${alertType}: ${message}`);
+  console.log('ALERT [' + severity + '] ' + alertType + ': ' + message);
   try {
     await supabase.from('alerts').insert({
       code:       alertType,
@@ -189,10 +170,11 @@ async function logAlert(alertType, severity, message) {
       message,
       created_at: new Date().toISOString(),
     });
-  } catch (e) { console.error('Supabase alerts error:', e.message); }
+  } catch (e) {
+    console.error('Supabase alerts error:', e.message);
+  }
 }
 
-// ── CTRADER CONNECTION ────────────────────────────────────────────────────────
 let connection   = null;
 let isConnected  = false;
 let reconnecting = false;
@@ -206,7 +188,7 @@ async function connectToCTrader() {
     console.log('Connecting to cTrader...');
     connection = new CTraderConnection({ host: HOST, port: 5035 });
 
-    connection.on('close', () => {
+    connection.on('close', function() {
       console.warn('cTrader connection closed — scheduling reconnect');
       isConnected  = false;
       reconnecting = false;
@@ -214,7 +196,7 @@ async function connectToCTrader() {
       setTimeout(connectToCTrader, 3000);
     });
 
-    connection.on('error', (err) => {
+    connection.on('error', function(err) {
       console.error('cTrader connection error:', err.message);
       isConnected = false;
     });
@@ -223,7 +205,8 @@ async function connectToCTrader() {
     console.log('Connected to cTrader');
 
     await connection.sendCommand('ProtoOAApplicationAuthReq', {
-      clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
     });
     console.log('Application authenticated');
 
@@ -238,48 +221,46 @@ async function connectToCTrader() {
       includeArchivedSymbols: false,
     });
     symbolIdMap = {};
-    (symRes.symbol || []).forEach(s => {
+    (symRes.symbol || []).forEach(function(s) {
       symbolIdMap[s.symbolName] = s.symbolId;
     });
     console.log('Symbols loaded:', Object.keys(symbolIdMap).length);
 
-    // Log which of our target symbols resolved successfully
-    Object.entries(SYMBOL_MAP).forEach(([tv, ct]) => {
-      const id = symbolIdMap[ct];
-      console.log(`  ${tv} → ${ct} → symbolId: ${id || 'NOT FOUND'}`);
+    Object.keys(SYMBOL_MAP).forEach(function(tv) {
+      var ct = SYMBOL_MAP[tv];
+      var id = symbolIdMap[ct];
+      console.log(' ', tv, '->', ct, '-> symbolId:', id || 'NOT FOUND');
     });
 
-    setInterval(() => connection.sendHeartbeat(), 25000);
+    setInterval(function() { connection.sendHeartbeat(); }, 25000);
 
     isConnected  = true;
     reconnecting = false;
-    console.log(`=== ENGINE READY | Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'} ===`);
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.12 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
+    console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
+    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.12 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
-} catch (err) {
-    const errMsg = err?.message || JSON.stringify(err) || String(err);
-    console.error('cTrader connection failed:', errMsg);
-    console.error('Full error object:', JSON.stringify(err));
+  } catch (err) {
+    var msg = (err && err.message) ? err.message : JSON.stringify(err);
+    console.error('cTrader connection failed:', msg);
     reconnecting = false;
-    await logAlert('CONNECTION_FAILED', 'CRITICAL', errMsg);
+    await logAlert('CONNECTION_FAILED', 'CRITICAL', msg);
     setTimeout(connectToCTrader, 5000);
   }
+}
 
-// ── PIPELINE WASHDOWN ─────────────────────────────────────────────────────────
 async function washdownQueue() {
   try {
-    let flushed = 0;
+    var flushed = 0;
     while (true) {
-      const res  = await fetch(`${UPSTASH_URL}/rpop/hawk:signals`,
-        { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-      const data = await res.json();
+      var res  = await fetch(UPSTASH_URL + '/rpop/hawk:signals',
+        { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } });
+      var data = await res.json();
       if (!data.result) break;
       flushed++;
     }
     if (flushed > 0) {
-      console.log(`Pipeline washdown: flushed ${flushed} stale signals`);
-      await logAlert('PIPELINE_RESET', 'WARN',
-        `Startup washdown flushed ${flushed} stale signals.`);
+      console.log('Pipeline washdown: flushed', flushed, 'stale signals');
+      await logAlert('PIPELINE_RESET', 'WARN', 'Startup washdown flushed ' + flushed + ' stale signals.');
     } else {
       console.log('Pipeline washdown: queue was empty');
     }
@@ -288,80 +269,76 @@ async function washdownQueue() {
   }
 }
 
-// ── RECONCILE CONFIRMATION — entry ────────────────────────────────────────────
 async function reconcileConfirm(dbId, symbolId, isLong) {
   try {
-    console.log(`Reconcile check | dbId:${dbId}`);
-    const posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
+    console.log('Reconcile check | dbId:' + dbId);
+    var posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
       ctidTraderAccountId: ACCOUNT_ID,
     });
-    const tradeSide = isLong ? 'BUY' : 'SELL';
-    const position  = (posRes.position || []).find(p =>
-      String(p.tradeData?.symbolId) === String(symbolId) &&
-      p.tradeData?.tradeSide === tradeSide
-    );
+    var tradeSide = isLong ? 'BUY' : 'SELL';
+    var position  = (posRes.position || []).find(function(p) {
+      return String(p.tradeData && p.tradeData.symbolId) === String(symbolId) &&
+             p.tradeData && p.tradeData.tradeSide === tradeSide;
+    });
     if (!position) {
-      console.warn(`Reconcile: no ${tradeSide} position found for symbolId:${symbolId}`);
-      await supabase.from('signal_log').update({
-        status: 'RECONCILE_NO_POSITION',
-      }).eq('id', dbId);
-      await logAlert('ORDER_UNCONFIRMED', 'WARN',
-        `Order sent but reconcile found no position. dbId:${dbId}`);
+      console.warn('Reconcile: no', tradeSide, 'position found for symbolId:' + symbolId);
+      await supabase.from('signal_log').update({ status: 'RECONCILE_NO_POSITION' }).eq('id', dbId);
+      await logAlert('ORDER_UNCONFIRMED', 'WARN', 'Order sent but reconcile found no position. dbId:' + dbId);
       return;
     }
-    const positionId = position.positionId ? String(position.positionId) : null;
-    console.log(`Reconcile CONFIRMED | positionId:${positionId}`);
+    var positionId = position.positionId ? String(position.positionId) : null;
+    console.log('Reconcile CONFIRMED | positionId:' + positionId);
     await supabase.from('signal_log').update({
-      status:      'EXECUTED',
-      position_id: positionId,
-      api_response: JSON.stringify({ positionId, tradeSide }),
+      status:       'EXECUTED',
+      position_id:  positionId,
+      api_response: JSON.stringify({ positionId: positionId, tradeSide: tradeSide }),
     }).eq('id', dbId);
   } catch (err) {
     console.error('Reconcile confirm error:', err.message);
-    await logAlert('RECONCILE_ERROR', 'CRITICAL',
-      `Reconcile failed for dbId:${dbId} — ${err.message}`);
+    await logAlert('RECONCILE_ERROR', 'CRITICAL', 'Reconcile failed for dbId:' + dbId + ' — ' + err.message);
   }
 }
 
-// ── RECONCILE CONFIRMATION — exit ─────────────────────────────────────────────
-async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt = 1) {
+async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt) {
+  attempt = attempt || 1;
   try {
-    const posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
+    var posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
       ctidTraderAccountId: ACCOUNT_ID,
     });
-    const tradeSide = isLong ? 'BUY' : 'SELL';
-    const stillOpen = (posRes.position || []).find(p =>
-      String(p.tradeData?.symbolId) === String(symbolId) &&
-      p.tradeData?.tradeSide === tradeSide
-    );
+    var tradeSide = isLong ? 'BUY' : 'SELL';
+    var stillOpen = (posRes.position || []).find(function(p) {
+      return String(p.tradeData && p.tradeData.symbolId) === String(symbolId) &&
+             p.tradeData && p.tradeData.tradeSide === tradeSide;
+    });
     if (stillOpen && attempt < 3) {
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt + 1), 1000);
+      setTimeout(function() {
+        reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt + 1);
+      }, 1000);
       return;
     }
     if (stillOpen) {
       await logAlert('EXIT_UNCONFIRMED', 'WARN',
-        `Position still open after ${attempt} checks. dbId:${dbId}`);
+        'Position still open after ' + attempt + ' checks. dbId:' + dbId);
       return;
     }
-    console.log(`Exit confirmed | positionId:${positionId}`);
+    console.log('Exit confirmed | positionId:' + positionId);
     await supabase.from('signal_log').update({
-      status:      'CLOSED',
-      position_id: positionId,
-      api_response: JSON.stringify({ positionId, tradeSide }),
+      status:       'CLOSED',
+      position_id:  positionId,
+      api_response: JSON.stringify({ positionId: positionId, tradeSide: tradeSide }),
     }).eq('id', dbId);
   } catch (err) {
     console.error('Exit reconcile error:', err.message);
     await logAlert('EXIT_RECONCILE_ERROR', 'CRITICAL',
-      `Exit reconcile failed for dbId:${dbId} — ${err.message}`);
+      'Exit reconcile failed for dbId:' + dbId + ' — ' + err.message);
   }
 }
 
-// ── SIGNAL EXECUTION ──────────────────────────────────────────────────────────
 async function executeSignal(signal) {
-  const latencyMs = getLatencyMs(signal);
+  var latencyMs = getLatencyMs(signal);
 
   if (isExpired(signal)) {
-    console.warn(`Signal EXPIRED: ${signal.signal_id} | age: ${latencyMs}ms`);
+    console.warn('Signal EXPIRED:', signal.signal_id, '| age:', latencyMs + 'ms');
     await logSignal(signal, null, 'EXPIRED', 'Signal age exceeded 5000ms', latencyMs);
     return;
   }
@@ -377,16 +354,16 @@ async function executeSignal(signal) {
     return;
   }
 
-  const action   = signal.action;
-  const isEntry  = action === 'LONG' || action === 'SHORT';
-  const isExit   = action === 'LONG_EXIT'      || action === 'SHORT_EXIT'  ||
-                   action === 'LONG_STOP'       || action === 'SHORT_STOP'  ||
-                   action === 'LONG_MKT_CLOSE'  || action === 'SHORT_MKT_CLOSE';
-  const isLong   = action === 'LONG' || action === 'LONG_EXIT' ||
-                   action === 'LONG_STOP' || action === 'LONG_MKT_CLOSE';
+  var action  = signal.action;
+  var isEntry = action === 'LONG' || action === 'SHORT';
+  var isExit  = action === 'LONG_EXIT'     || action === 'SHORT_EXIT'   ||
+                action === 'LONG_STOP'     || action === 'SHORT_STOP'   ||
+                action === 'LONG_MKT_CLOSE'|| action === 'SHORT_MKT_CLOSE';
+  var isLong  = action === 'LONG'          || action === 'LONG_EXIT'    ||
+                action === 'LONG_STOP'     || action === 'LONG_MKT_CLOSE';
 
-  const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
-  const symbolId = symbolIdMap[ctSymbol];
+  var ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
+  var symbolId = symbolIdMap[ctSymbol];
 
   if (!symbolId) {
     console.error('Symbol not found:', ctSymbol);
@@ -396,71 +373,68 @@ async function executeSignal(signal) {
 
   try {
     if (isEntry) {
-      // Enforce one position per ticker per side
-      const posRes   = await connection.sendCommand('ProtoOAReconcileReq', {
+      var posRes   = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
-      const existing = (posRes.position || []).find(p =>
-        String(p.tradeData?.symbolId) === String(symbolId) &&
-        (isLong ? p.tradeData?.tradeSide === 'BUY' : p.tradeData?.tradeSide === 'SELL')
-      );
+      var existing = (posRes.position || []).find(function(p) {
+        return String(p.tradeData && p.tradeData.symbolId) === String(symbolId) &&
+               p.tradeData && p.tradeData.tradeSide === (isLong ? 'BUY' : 'SELL');
+      });
       if (existing) {
         console.log('Position already open — skipping entry:', ctSymbol);
         await logSignal(signal, null, 'DUPLICATE_POSITION', null, latencyMs);
         return;
       }
 
-      const volume   = resolveVolume(signal);
+      var volume = resolveVolume(signal);
       if (volume === 0) {
-        console.warn(`[ZERO VOLUME] ${signal.ticker} score=${signal.score} — order skipped`);
+        console.warn('[ZERO VOLUME]', signal.ticker, 'score=' + signal.score, '— order skipped');
         await logSignal(signal, null, 'SKIPPED', 'Zero volume — review lot size configuration', latencyMs);
         return;
       }
 
-      const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100000);
-      console.log(`Order | ${ctSymbol} | ${isLong ? 'BUY' : 'SELL'} | ${volume} units | SL: ${stopLoss} | latency: ${latencyMs}ms`);
+      var stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100000);
+      console.log('Order |', ctSymbol, '|', isLong ? 'BUY' : 'SELL', '|', volume, 'units | SL:', stopLoss, '| latency:', latencyMs + 'ms');
 
-      const dbId = await logSignal(signal, { symbolId, volume, stopLoss }, 'PENDING_FILL', null, latencyMs);
+      var dbId = await logSignal(signal, { symbolId: symbolId, volume: volume, stopLoss: stopLoss }, 'PENDING_FILL', null, latencyMs);
 
       try {
         await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
-          symbolId,
-          orderType:        'MARKET',
-          tradeSide:        isLong ? 'BUY' : 'SELL',
-          volume,
-          relativeStopLoss: stopLoss,
-          comment:          `HAWK|${signal.strategy_id}|S${signal.score}`,
+          symbolId:            symbolId,
+          orderType:           'MARKET',
+          tradeSide:           isLong ? 'BUY' : 'SELL',
+          volume:              volume,
+          relativeStopLoss:    stopLoss,
+          comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
         console.log('Order sent to cTrader');
       } catch (e) {
         console.error('Order send error:', e.message);
-        await supabase.from('signal_log').update({
-          status: 'ERROR', error_message: e.message,
-        }).eq('id', dbId);
+        await supabase.from('signal_log').update({ status: 'ERROR', error_message: e.message }).eq('id', dbId);
         return;
       }
 
-      setTimeout(() => reconcileConfirm(dbId, symbolId, isLong), 1500);
+      setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 1500);
 
     } else if (isExit) {
-      const posRes   = await connection.sendCommand('ProtoOAReconcileReq', {
+      var posRes2  = await connection.sendCommand('ProtoOAReconcileReq', {
         ctidTraderAccountId: ACCOUNT_ID,
       });
-      const position = (posRes.position || []).find(p =>
-        String(p.tradeData?.symbolId) === String(symbolId) &&
-        (isLong ? p.tradeData?.tradeSide === 'BUY' : p.tradeData?.tradeSide === 'SELL')
-      );
+      var position = (posRes2.position || []).find(function(p) {
+        return String(p.tradeData && p.tradeData.symbolId) === String(symbolId) &&
+               p.tradeData && p.tradeData.tradeSide === (isLong ? 'BUY' : 'SELL');
+      });
       if (!position) {
         console.log('No matching position for', action, ctSymbol);
         await logSignal(signal, null, 'NO_POSITION', null, latencyMs);
         return;
       }
 
-      const positionId = position.positionId ? String(position.positionId) : null;
+      var positionId = position.positionId ? String(position.positionId) : null;
       console.log('Closing position:', positionId, '| latency:', latencyMs + 'ms');
 
-      const dbId = await logSignal(signal, { positionId }, 'PENDING_CLOSE', null, latencyMs);
+      var dbId2 = await logSignal(signal, { positionId: positionId }, 'PENDING_CLOSE', null, latencyMs);
 
       try {
         await connection.sendCommand('ProtoOAClosePositionReq', {
@@ -471,16 +445,14 @@ async function executeSignal(signal) {
         console.log('Close sent to cTrader');
       } catch (e) {
         console.error('Close send error:', e.message);
-        await supabase.from('signal_log').update({
-          status: 'ERROR', error_message: e.message,
-        }).eq('id', dbId);
+        await supabase.from('signal_log').update({ status: 'ERROR', error_message: e.message }).eq('id', dbId2);
         return;
       }
 
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1500);
+      setTimeout(function() { reconcileExitConfirm(dbId2, positionId, symbolId, isLong); }, 1500);
 
     } else {
-      console.warn(`[UNKNOWN ACTION] ${action} — skipped`);
+      console.warn('[UNKNOWN ACTION]', action, '— skipped');
     }
 
   } catch (err) {
@@ -489,24 +461,23 @@ async function executeSignal(signal) {
   }
 }
 
-// ── HTTP SERVER ───────────────────────────────────────────────────────────────
 function startHttpServer() {
-  const app = express();
+  var app = express();
   app.use(express.json());
 
-  app.post('/signal', async (req, res) => {
+  app.post('/signal', async function(req, res) {
     if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    const signal = req.body;
+    var signal = req.body;
     if (!signal || !signal.signal_id) {
       return res.status(400).json({ error: 'Invalid signal' });
     }
     res.status(200).json({ ok: true });
-    setImmediate(() => executeSignal(signal));
+    setImmediate(function() { executeSignal(signal); });
   });
 
-  app.get('/health', (req, res) => {
+  app.get('/health', function(req, res) {
     res.json({
       status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:    IS_PAPER ? 'PAPER' : 'LIVE',
@@ -515,20 +486,15 @@ function startHttpServer() {
     });
   });
 
-  app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
+  app.listen(PORT, function() {
+    console.log('HTTP server listening on port', PORT);
+  });
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(`╔════════════════════════════════════════════╗`);
-  console.log(`║  HAWK Execution Engine v2.12 STARTED       ║`);
-  console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
-  console.log(`╚════════════════════════════════════════════╝`);
-
   await refreshAccessToken();
 
-  // Refresh token every 20 days
-  setInterval(async () => {
+  setInterval(async function() {
     try { await refreshAccessToken(); }
     catch (e) { logAlert('TOKEN_REFRESH_FAILED', 'CRITICAL', e.message); }
   }, 20 * 24 * 60 * 60 * 1000);
@@ -537,20 +503,19 @@ async function main() {
   await connectToCTrader();
   startHttpServer();
 
-  // Heartbeat logging every 60 seconds
-  setInterval(async () => {
-    const daysLeft = tokenExpiryTime
+  setInterval(async function() {
+    var daysLeft = tokenExpiryTime
       ? Math.floor((tokenExpiryTime - Date.now()) / 86400000)
       : null;
     await logHealth(isConnected ? 'RUNNING' : 'DISCONNECTED', daysLeft);
     if (daysLeft !== null && daysLeft < 2) {
       await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
-        `cTrader access token expires in ${daysLeft} days. Immediate action required.`);
+        'cTrader access token expires in ' + daysLeft + ' days. Immediate action required.');
     }
   }, 60000);
 }
 
-main().catch(err => {
+main().catch(function(err) {
   console.error('Fatal startup error:', err.message);
   process.exit(1);
 });
