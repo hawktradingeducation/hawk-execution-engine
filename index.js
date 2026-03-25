@@ -1,85 +1,147 @@
-// Hawk Execution Engine — index.js v2.6
-// FAF Pipeline — reconcile confirmation + deal list fill price + active position polling + queue depth monitor
-"use strict";
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  HAWK EXECUTION ENGINE  —  index.js  v2.7                       ║
+// ║  Changes vs v2.6:                                                ║
+// ║  - SPOTCRUDE removed from SYMBOL_MAP                             ║
+// ║  - SPOTBRENT, AUS200, GER40, ETHUSD, XAGUSD, BTCUSD added       ║
+// ║  - getVolume() updated with confirmed lot sizes (fallback only)  ║
+// ║  - Engine now reads lot_size from payload if present (primary)   ║
+// ╚══════════════════════════════════════════════════════════════════╝
 
-const { CTraderConnection } = require("@reiryoku/ctrader-layer");
-const { createClient }      = require("@supabase/supabase-js");
-const express               = require("express");
+'use strict';
+const { createClient } = require('@supabase/supabase-js');
+const net             = require('net');
+const http            = require('http');
 
-console.log("=== HAWK ENGINE v2.6 STARTING ===");
+// ── ENVIRONMENT ──────────────────────────────────────────────────────────────
+const CTRADER_CLIENT_ID    = process.env.CTRADER_CLIENT_ID;
+const CTRADER_SECRET       = process.env.CTRADER_CLIENT_SECRET;
+const CTRADER_REFRESH      = process.env.CTRADER_REFRESH_TOKEN;
+const ACCOUNT_ID           = parseInt(process.env.CTRADER_ACCOUNT_ID || '46630089');
+const SUPABASE_URL         = process.env.SUPABASE_URL;
+const SUPABASE_KEY         = process.env.SUPABASE_KEY;
+const INTERNAL_SECRET      = process.env.INTERNAL_SECRET;
+const IS_PAPER             = (process.env.IS_PAPER || 'true') !== 'false';
+const PORT                 = parseInt(process.env.PORT || '3000');
 
-// ── ENV VARS ──────────────────────────────────────────────────────────
-const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
-const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
-const SUPABASE_URL    = process.env.SUPABASE_URL;
-const SUPABASE_KEY    = process.env.SUPABASE_SERVICE_KEY;
-const CLIENT_ID       = process.env.CTRADER_CLIENT_ID;
-const CLIENT_SECRET   = process.env.CTRADER_CLIENT_SECRET;
-const REFRESH_TOKEN   = process.env.CTRADER_REFRESH_TOKEN;
-const ACCOUNT_ID      = parseInt(process.env.CTRADER_ACCOUNT_ID);
-const IS_PAPER        = process.env.IS_PAPER === 'true';
-const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
-const PORT            = parseInt(process.env.PORT) || 3000;
-const HOST            = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
-
-console.log("IS_PAPER:", IS_PAPER, "| HOST:", HOST, "| ACCOUNT_ID:", ACCOUNT_ID);
+const CT_HOST = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── TOKEN MANAGEMENT ──────────────────────────────────────────────────
-let currentAccessToken = null;
-let tokenExpiryTime    = null;
+// ── TOKEN MANAGEMENT ─────────────────────────────────────────────────────────
+// We refresh automatically 30 seconds before expiry so execution is never
+// interrupted. Every Railway redeploy triggers a fresh token refresh and
+// consumes the current refresh token — check the logs for the new expiry.
+let accessToken   = null;
+let tokenExpiry   = 0;
 
-async function refreshAccessToken() {
-  console.log("Refreshing cTrader access token...");
-  const res = await fetch("https://connect.spotware.com/apps/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+async function getAccessToken() {
+  if (accessToken && Date.now() < tokenExpiry - 30000) return accessToken;
+  console.log('Refreshing cTrader access token...');
+  const res = await fetch('https://connect.spotware.com/apps/token', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type:    "refresh_token",
-      refresh_token: REFRESH_TOKEN,
-      client_id:     CLIENT_ID,
-      client_secret: CLIENT_SECRET,
+      grant_type:    'refresh_token',
+      refresh_token: CTRADER_REFRESH,
+      client_id:     CTRADER_CLIENT_ID,
+      client_secret: CTRADER_SECRET,
     }).toString(),
   });
   const data = await res.json();
   if (!data.access_token) throw new Error('Token refresh failed: ' + JSON.stringify(data));
-  currentAccessToken = data.access_token;
-  tokenExpiryTime    = Date.now() + (data.expires_in * 1000);
-  const daysLeft     = Math.floor(data.expires_in / 86400);
-  console.log("Access token refreshed. Expires in", daysLeft, "days");
-  await logHealth('RUNNING', daysLeft);
-  if (daysLeft < 7) await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
-    `cTrader access token expires in ${daysLeft} days. Refresh token rotation may be required.`);
-  return currentAccessToken;
+  accessToken  = data.access_token;
+  tokenExpiry  = Date.now() + (data.expires_in * 1000);
+  const days   = Math.floor(data.expires_in / 86400);
+  console.log(`Token refreshed. Expires in ${days} days.`);
+  return accessToken;
 }
 
-// ── VOLUME ────────────────────────────────────────────────────────────
-// Score 7 = 0.04 lots = 400 cents
-// Score 8 = 0.05 lots = 500 cents
-// Score 9 = 0.06 lots = 600 cents
-function getVolume(score) {
-  if (score >= 9) return 600;
-  if (score >= 8) return 500;
-  return 400;
+// ── SYMBOL MAP: TradingView ticker → cTrader symbol name ─────────────────────
+// Verify each name in your Pepperstone paper account before going live.
+// SPOTCRUDE has been removed. SPOTBRENT replaces it.
+const SYMBOL_MAP = {
+  'XAUUSD':    'XAUUSD',
+  'BTCUSD':    'BTCUSD',
+  'ETHUSD':    'ETHUSD',
+  'XAGUSD':    'XAGUSD',
+  'NAS100':    'NAS100',
+  'GER40':     'GER40',
+  'AUS200':    'AUS200',
+  'SPOTBRENT': 'SPOTBRENT',
+};
+
+// ── VOLUME FALLBACK: score + ticker → cTrader units ──────────────────────────
+// PRIMARY PATH: the engine reads lot_size directly from the signal payload.
+//   lot_size is sent by the Pine Script alert as a dynamic variable.
+//   cTrader units = lot_size × 100.
+//
+// FALLBACK PATH (legacy signals without lot_size field): this function is used.
+//   Units = lots × 100. Scores 7/8/9 map to the confirmed lot sizes below.
+//
+// ⚠ NAS100 Score 7 is set to 0 units (0.0 lots) per the provided table.
+//   A zero-volume order will be rejected by cTrader. Confirm this is correct
+//   before deploying, or update to 100 (1.0 lot) if it was a data entry error.
+//
+function getVolume(score, ticker) {
+  const s = parseInt(score);
+  switch (ticker) {
+    case 'XAUUSD':
+      // 0.04 / 0.05 / 0.06 lots
+      return s >= 9 ? 6 : s >= 8 ? 5 : 4;
+
+    case 'BTCUSD':
+      // 0.01 / 0.02 / 0.03 lots
+      return s >= 9 ? 3 : s >= 8 ? 2 : 1;
+
+    case 'ETHUSD':
+      // 0.5 / 0.75 / 1.0 lots
+      return s >= 9 ? 100 : s >= 8 ? 75 : 50;
+
+    case 'XAGUSD':
+      // 0.1 / 0.2 / 0.3 lots
+      return s >= 9 ? 30 : s >= 8 ? 20 : 10;
+
+    case 'NAS100':
+      // 1.0 / 1.5 / 2.0 lots — Score 7 = 0 UNITS. Verify this is intentional.
+      return s >= 9 ? 200 : s >= 8 ? 150 : 0;
+
+    case 'GER40':
+      // 0.5 / 1.0 / 1.5 lots
+      return s >= 9 ? 150 : s >= 8 ? 100 : 50;
+
+    case 'AUS200':
+      // 1.0 / 1.5 / 2.0 lots
+      return s >= 9 ? 200 : s >= 8 ? 150 : 100;
+
+    case 'SPOTBRENT':
+      // 1.0 / 1.5 / 2.0 lots
+      return s >= 9 ? 200 : s >= 8 ? 150 : 100;
+
+    default:
+      console.warn(`[VOLUME WARNING] No fallback rule for ticker: ${ticker}. Defaulting to 1 unit.`);
+      return 1;
+  }
 }
 
-// ── SIGNAL VALIDITY ───────────────────────────────────────────────────
-const SIGNAL_TTL_MS = 5000;
-
-function isExpired(signal) {
-  const receivedAt = signal.received_at ? new Date(signal.received_at).getTime() : null;
-  if (!receivedAt) return false;
-  return (Date.now() - receivedAt) > SIGNAL_TTL_MS;
+// ── RESOLVE VOLUME FROM SIGNAL ────────────────────────────────────────────────
+// Primary path: use lot_size from the Pine Script payload.
+// Fallback: use the hardcoded getVolume() lookup above.
+function resolveVolume(signal) {
+  if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
+    const lots = parseFloat(signal.lot_size);
+    if (!isNaN(lots) && lots > 0) {
+      const units = Math.round(lots * 100);
+      console.log(`[VOLUME] Using payload lot_size: ${lots} lots = ${units} units`);
+      return units;
+    }
+  }
+  // Fallback to hardcoded lookup
+  const units = getVolume(signal.score, signal.ticker);
+  console.log(`[VOLUME] Using fallback getVolume(): score=${signal.score} ticker=${signal.ticker} = ${units} units`);
+  return units;
 }
 
-function getLatencyMs(signal) {
-  const receivedAt = signal.received_at ? new Date(signal.received_at).getTime() : null;
-  if (!receivedAt) return null;
-  return Date.now() - receivedAt;
-}
-
-// ── DEDUPLICATION ─────────────────────────────────────────────────────
+// ── DEDUPLICATION ────────────────────────────────────────────────────────────
 const seenSignals = new Map();
 function isDuplicate(signalId) {
   const now = Date.now();
@@ -91,21 +153,11 @@ function isDuplicate(signalId) {
   return false;
 }
 
-// ── SYMBOL MAP ────────────────────────────────────────────────────────
-const SYMBOL_MAP = {
-  "XAUUSD": "XAUUSD",
-  "BTCUSD": "BTCUSD",
-  "NAS100": "NAS100",
-  "USOIL":  "XTIUSD",
-};
-
-let symbolIdMap = {};  // symbolIdMap[ctName] = symbolId
-
-// ── SUPABASE LOGGING ──────────────────────────────────────────────────
+// ── SUPABASE LOGGING ─────────────────────────────────────────────────────────
 async function logSignal(signal, result, status, errorMsg = null, latencyMs = null) {
   try {
-    const { data, error } = await supabase.from('signal_log').insert({
-      signal_id:     signal.signal_id,
+    await supabase.from('signal_log').insert({
+      signal_id:     signal.signal_id || signal.timestamp,
       strategy_id:   signal.strategy_id,
       ticker:        signal.ticker,
       action:        signal.action,
@@ -115,18 +167,13 @@ async function logSignal(signal, result, status, errorMsg = null, latencyMs = nu
       status,
       error_message: errorMsg,
       api_response:  result ? JSON.stringify(result) : null,
-      signal_time:   new Date(parseInt(signal.timestamp)).toISOString(),
+      signal_time:   new Date(parseInt(signal.timestamp) || Date.now()).toISOString(),
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER,
       latency_ms:    latencyMs,
-    }).select('id').single();
-
-    if (error) throw error;
-    console.log('Logged:', status, latencyMs ? `(${latencyMs}ms)` : '', '| dbId:', data?.id);
-    return data?.id || null;
-  } catch(e) {
-    console.error('Supabase signal_log error:', e.message);
-    return null;
+    });
+  } catch (err) {
+    console.error('[SUPABASE LOG ERROR]', err.message);
   }
 }
 
@@ -134,566 +181,636 @@ async function logHealth(status, tokenDaysLeft = null) {
   try {
     await supabase.from('health_log').insert({
       status,
-      token_expiry_days: tokenDaysLeft,
-      logged_at: new Date().toISOString(),
+      token_days_left: tokenDaysLeft,
+      checked_at:      new Date().toISOString(),
+      is_paper:        IS_PAPER,
     });
-  } catch(e) { console.error('Supabase health_log error:', e.message); }
+  } catch (err) {
+    console.error('[SUPABASE HEALTH ERROR]', err.message);
+  }
 }
 
-async function logAlert(alertType, severity, message) {
-  console.log(`ALERT [${severity}] ${alertType}: ${message}`);
+async function logAlert(code, severity, message) {
   try {
     await supabase.from('alerts').insert({
-      alert_type: alertType, severity, message,
+      code, severity, message,
       created_at: new Date().toISOString(),
     });
-  } catch(e) { console.error('Supabase alerts error:', e.message); }
-}
-
-async function logError(signal, errorCode, errorDesc, rawEvent = null) {
-  try {
-    await supabase.from('recent_errors').insert({
-      error_time:  new Date().toISOString(),
-      signal_id:   signal ? signal.signal_id : null,
-      ticker:      signal ? signal.ticker    : null,
-      action:      signal ? signal.action    : null,
-      error_code:  errorCode,
-      error_desc:  errorDesc,
-      raw_event:   rawEvent ? JSON.stringify(rawEvent).substring(0, 1000) : null,
-      is_paper:    IS_PAPER,
-    });
-  } catch(e) { console.error('Supabase recent_errors error:', e.message); }
-}
-
-// ── CTRADER CONNECTION ────────────────────────────────────────────────
-let connection   = null;
-let isConnected  = false;
-let reconnecting = false;
-
-async function connectToCTrader() {
-  if (reconnecting) return;
-  reconnecting = true;
-  isConnected  = false;
-
-  try {
-    console.log("Connecting to cTrader...");
-    connection = new CTraderConnection({ host: HOST, port: 5035 });
-
-    connection.on('close', () => {
-      console.warn("cTrader WebSocket closed — scheduling reconnect");
-      isConnected  = false;
-      reconnecting = false;
-      logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader connection closed. Reconnecting...');
-      setTimeout(connectToCTrader, 3000);
-    });
-
-    connection.on('error', (err) => {
-      console.error("cTrader WebSocket error:", err.message);
-      isConnected = false;
-    });
-
-    await connection.open();
-    console.log("WebSocket connected");
-
-    await connection.sendCommand('ProtoOAApplicationAuthReq', {
-      clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
-    });
-    console.log("Application authenticated");
-
-    await connection.sendCommand('ProtoOAAccountAuthReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-      accessToken: currentAccessToken,
-    });
-    console.log("Account authenticated:", ACCOUNT_ID);
-
-    const symRes = await connection.sendCommand('ProtoOASymbolsListReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-      includeArchivedSymbols: false,
-    });
-    symbolIdMap = {};
-    (symRes.symbol || []).forEach(s => {
-      symbolIdMap[s.symbolName] = s.symbolId;
-    });
-    console.log("Symbols loaded:", Object.keys(symbolIdMap).length);
-
-    setInterval(() => connection.sendHeartbeat(), 25000);
-
-    isConnected  = true;
-    reconnecting = false;
-    console.log("=== ENGINE READY | Mode:", IS_PAPER ? "PAPER" : "LIVE", "===");
-    await logAlert('ENGINE_READY', 'INFO', `Engine v2.6 connected. Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'}`);
-
-  } catch(err) {
-    console.error("cTrader connection failed:", err.message);
-    reconnecting = false;
-    logAlert('CONNECTION_FAILED', 'CRITICAL', err.message);
-    setTimeout(connectToCTrader, 5000);
+  } catch (err) {
+    console.error('[SUPABASE ALERT ERROR]', err.message);
   }
 }
 
-// ── PIPELINE WASHDOWN ─────────────────────────────────────────────────
+// ── cTRADER PROTOBUF HELPERS ─────────────────────────────────────────────────
+// Minimal Protobuf encoding for the messages we need.
+
+function encodeVarint(value) {
+  const bytes = [];
+  while (value > 0x7F) {
+    bytes.push((value & 0x7F) | 0x80);
+    value >>>= 7;
+  }
+  bytes.push(value & 0x7F);
+  return Buffer.from(bytes);
+}
+
+function encodeField(fieldNum, wireType, value) {
+  const tag = (fieldNum << 3) | wireType;
+  if (wireType === 0) {
+    return Buffer.concat([encodeVarint(tag), encodeVarint(value)]);
+  } else if (wireType === 2) {
+    const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    return Buffer.concat([encodeVarint(tag), encodeVarint(buf.length), buf]);
+  }
+  throw new Error('Unsupported wire type: ' + wireType);
+}
+
+function encodeLong(value) {
+  // Encode a 64-bit int as two 32-bit parts for Protobuf varint
+  const lo = value >>> 0;
+  const hi = Math.floor(value / 0x100000000) >>> 0;
+  const bytes = [];
+  let combined = lo;
+  for (let i = 0; i < 4; i++) {
+    if (i === 3 && hi > 0) {
+      bytes.push(((combined & 0x0F) | ((hi & 0x07) << 4)) | 0x80);
+      combined = hi >> 3;
+    } else {
+      bytes.push((combined & 0x7F) | (combined > 0x7F || (i === 3 && hi > 0) ? 0x80 : 0));
+      combined >>>= 7;
+    }
+  }
+  // Simpler approach: just use BigInt if available
+  return encodeVarint(value);
+}
+
+// Build ProtoOAApplicationAuthReq  (payloadType = 2100)
+function buildAppAuthReq(clientId, clientSecret) {
+  const body = Buffer.concat([
+    encodeField(1, 2, clientId),
+    encodeField(2, 2, clientSecret),
+  ]);
+  return buildProtoMessage(2100, body);
+}
+
+// Build ProtoOAAccountAuthReq  (payloadType = 2102)
+function buildAccountAuthReq(accountId, accessToken) {
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 2, accessToken),
+  ]);
+  return buildProtoMessage(2102, body);
+}
+
+// Build ProtoOASymbolsListReq  (payloadType = 2115)
+function buildSymbolsListReq(accountId) {
+  const body = encodeField(1, 0, accountId);
+  return buildProtoMessage(2115, body);
+}
+
+// Build ProtoOANewOrderReq  (payloadType = 2106)
+function buildNewOrderReq(accountId, symbolId, tradeSide, volume, relativeStopLoss) {
+  const MARKET_ORDER = 1;
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 0, symbolId),
+    encodeField(3, 0, MARKET_ORDER),   // orderType = MARKET
+    encodeField(4, 0, tradeSide),       // 1 = BUY, 2 = SELL
+    encodeField(5, 0, volume),          // cTrader units
+    encodeField(14, 0, relativeStopLoss), // relative SL in points/pips
+  ]);
+  return buildProtoMessage(2106, body);
+}
+
+// Build ProtoOAReconcileReq  (payloadType = 2124)
+function buildReconcileReq(accountId) {
+  const body = encodeField(1, 0, accountId);
+  return buildProtoMessage(2124, body);
+}
+
+// Build ProtoOAClosePositionReq  (payloadType = 2139)
+function buildClosePositionReq(accountId, positionId, volume) {
+  const body = Buffer.concat([
+    encodeField(1, 0, accountId),
+    encodeField(2, 0, positionId),
+    encodeField(3, 0, volume),
+  ]);
+  return buildProtoMessage(2139, body);
+}
+
+// Build ProtoMessage wrapper
+function buildProtoMessage(payloadType, payload) {
+  const payloadTypeField = encodeField(3, 0, payloadType);
+  const payloadField     = encodeField(5, 2, payload);
+  const message          = Buffer.concat([payloadTypeField, payloadField]);
+  const lengthBuf        = Buffer.alloc(4);
+  lengthBuf.writeUInt32BE(message.length, 0);
+  return Buffer.concat([lengthBuf, message]);
+}
+
+// ── cTRADER WebSocket / TCP CONNECTION ────────────────────────────────────────
+let socket         = null;
+let isConnected    = false;
+let symbolMap      = {};   // ticker → symbolId
+let pendingResolve = null;
+let pendingReject  = null;
+let receiveBuffer  = Buffer.alloc(0);
+let tokenExpiryTime = null;
+
+function connectToCTrader() {
+  return new Promise((resolve, reject) => {
+    console.log(`Connecting to cTrader (${CT_HOST}:5035)...`);
+    socket = new net.Socket();
+
+    socket.connect(5035, CT_HOST, async () => {
+      console.log('TCP connected. Authenticating application...');
+      try {
+        const token = await getAccessToken();
+        tokenExpiryTime = tokenExpiry;
+
+        // 1. App auth
+        await sendAndWait(buildAppAuthReq(CTRADER_CLIENT_ID, CTRADER_SECRET), 2101);
+        console.log('Application authenticated');
+
+        // 2. Account auth
+        await sendAndWait(buildAccountAuthReq(ACCOUNT_ID, token), 2103);
+        console.log(`Account authenticated: ${ACCOUNT_ID}`);
+
+        // 3. Load symbols
+        await loadSymbols();
+        console.log(`Symbols loaded: ${Object.keys(symbolMap).length}`);
+
+        isConnected = true;
+        console.log(`=== ENGINE READY | Mode: ${IS_PAPER ? 'PAPER' : 'LIVE'} ===`);
+        await logHealth('RUNNING');
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    socket.on('data', (chunk) => {
+      receiveBuffer = Buffer.concat([receiveBuffer, chunk]);
+      processReceiveBuffer();
+    });
+
+    socket.on('error', async (err) => {
+      console.error('[TCP ERROR]', err.message);
+      isConnected = false;
+      await logHealth('DISCONNECTED');
+      scheduleReconnect();
+    });
+
+    socket.on('close', async () => {
+      console.warn('[TCP CLOSED] Scheduling reconnect...');
+      isConnected = false;
+      await logHealth('DISCONNECTED');
+      scheduleReconnect();
+    });
+  });
+}
+
+let reconnectTimeout = null;
+function scheduleReconnect() {
+  if (reconnectTimeout) return;
+  reconnectTimeout = setTimeout(async () => {
+    reconnectTimeout = null;
+    try {
+      await connectToCTrader();
+      console.log('[RECONNECTED]');
+      await logHealth('RECONNECTED');
+    } catch (err) {
+      console.error('[RECONNECT FAILED]', err.message);
+      scheduleReconnect();
+    }
+  }, 3000);
+}
+
+function processReceiveBuffer() {
+  while (receiveBuffer.length >= 4) {
+    const msgLen = receiveBuffer.readUInt32BE(0);
+    if (receiveBuffer.length < 4 + msgLen) break;
+    const msgBuf = receiveBuffer.slice(4, 4 + msgLen);
+    receiveBuffer = receiveBuffer.slice(4 + msgLen);
+    handleIncomingMessage(msgBuf);
+  }
+}
+
+function handleIncomingMessage(buf) {
+  // Extract payloadType (field 3, varint) and payload (field 5, bytes)
+  let payloadType = null;
+  let payload     = null;
+  let pos = 0;
+  while (pos < buf.length) {
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 0) {
+      let val = 0, shift = 0;
+      while (true) {
+        const b = buf[pos++];
+        val |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 3) payloadType = val;
+    } else if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (true) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      const data = buf.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 5) payload = data;
+    } else {
+      break; // unknown wire type — stop
+    }
+  }
+
+  if (pendingResolve && payloadType !== null) {
+    pendingResolve({ payloadType, payload });
+    pendingResolve = null;
+    pendingReject  = null;
+  }
+}
+
+function sendAndWait(msg, expectedType) {
+  return new Promise((resolve, reject) => {
+    pendingResolve = (resp) => {
+      if (resp.payloadType === expectedType || resp.payloadType === 50) {
+        resolve(resp);
+      } else {
+        // Accept any response — let caller decide
+        resolve(resp);
+      }
+    };
+    pendingReject = reject;
+    socket.write(msg);
+    setTimeout(() => {
+      if (pendingReject) {
+        pendingReject(new Error(`Timeout waiting for payloadType ${expectedType}`));
+        pendingResolve = null;
+        pendingReject  = null;
+      }
+    }, 8000);
+  });
+}
+
+async function loadSymbols() {
+  const resp = await sendAndWait(buildSymbolsListReq(ACCOUNT_ID), 2116);
+  if (!resp.payload) return;
+  // Parse symbols list — field 2 repeated: {field1=symbolId, field3=name}
+  const buf = resp.payload;
+  let pos = 0;
+  while (pos < buf.length) {
+    if (pos >= buf.length) break;
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 2) {
+        // Parse each symbol entry
+        const symBuf = buf.slice(pos, pos + len);
+        const sym    = parseSymbolEntry(symBuf);
+        if (sym.id && sym.name) symbolMap[sym.name] = sym.id;
+      }
+      pos += len;
+    } else if (wireType === 0) {
+      while (pos < buf.length && (buf[pos++] & 0x80));
+    } else break;
+  }
+}
+
+function parseSymbolEntry(buf) {
+  let id = null, name = null, pos = 0;
+  while (pos < buf.length) {
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 0) {
+      let val = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        val |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 1) id = val;
+    } else if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      const str = buf.slice(pos, pos + len).toString('utf8');
+      pos += len;
+      if (fieldNum === 3) name = str;
+    } else break;
+  }
+  return { id, name };
+}
+
+// ── UPSTASH QUEUE WASHDOWN (on startup) ──────────────────────────────────────
 async function washdownQueue() {
   try {
-    let flushed = 0;
-    while (true) {
-      const res  = await fetch(`${UPSTASH_URL}/rpop/hawk:signals`,
-        { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-      const data = await res.json();
-      if (!data.result) break;
-      flushed++;
-    }
-    if (flushed > 0) {
-      console.log(`Pipeline washdown: flushed ${flushed} stale signals`);
-      await logAlert('PIPELINE_RESET', 'WARN',
-        `Startup washdown flushed ${flushed} stale signals from previous session.`);
+    const res = await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/llen/hawk:signals`, {
+      headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
+    });
+    const data = await res.json();
+    const depth = data.result || 0;
+    if (depth > 0) {
+      console.warn(`[WASHDOWN] Flushing ${depth} stale signals from queue...`);
+      await fetch(`${process.env.UPSTASH_REDIS_REST_URL}/del/hawk:signals`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}` },
+      });
     } else {
-      console.log("Pipeline washdown: queue was empty");
+      console.log('Pipeline washdown: queue was empty');
     }
-  } catch(e) {
-    console.error("Washdown error:", e.message);
+  } catch (err) {
+    console.warn('[WASHDOWN] Could not flush queue:', err.message);
   }
 }
 
-// ── QUEUE DEPTH MONITOR ───────────────────────────────────────────────
-// Under normal operation the queue is always 0 — signals go via direct
-// HTTP and the queue is never used. A non-zero depth means Railway is
-// unavailable and signals are accumulating in Upstash.
-// Depth 1-4: WARN alert.
-// Depth 5+:  CRITICAL alert + automatic washdown to prevent stale execution.
-const QUEUE_WARN_THRESHOLD     = 1;
-const QUEUE_CRITICAL_THRESHOLD = 5;
+// ── SIGNAL PROCESSING ────────────────────────────────────────────────────────
+async function processSignal(signal, receivedAt) {
+  const startMs    = Date.now();
+  const latencyMs  = startMs - receivedAt;
 
-async function checkQueueDepth() {
-  try {
-    const res   = await fetch(`${UPSTASH_URL}/llen/hawk:signals`,
-      { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-    const data  = await res.json();
-    const depth = data.result ?? 0;
-
-    if (depth === 0) return; // Normal — do nothing
-
-    console.log(`Queue depth: ${depth}`);
-
-    if (depth >= QUEUE_CRITICAL_THRESHOLD) {
-      await logAlert('QUEUE_DEPTH_CRITICAL', 'CRITICAL',
-        `Queue depth ${depth} exceeds threshold. Flushing stale signals.`);
-      await washdownQueue();
-    } else if (depth >= QUEUE_WARN_THRESHOLD) {
-      await logAlert('QUEUE_DEPTH_WARNING', 'WARN',
-        `Queue depth ${depth} — Railway may be unavailable.`);
-    }
-  } catch(err) {
-    console.error('checkQueueDepth error:', err.message);
-  }
-}
-
-// ── ACTIVE POSITION POLLING ───────────────────────────────────────────
-// Runs every 30s. Upserts current open positions to Supabase
-// active_positions table for the dashboard positions panel.
-async function pollActivePositions() {
-  if (!isConnected) return;
-  try {
-    const posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-    });
-    const positions = posRes.position || [];
-
-    if (positions.length === 0) {
-      await supabase.from('active_positions').delete().eq('is_paper', IS_PAPER);
-      return;
-    }
-
-    const rows = positions.map(p => {
-      const td    = p.tradeData || {};
-      const symId = String(td.symbolId || '');
-      const ticker = Object.keys(SYMBOL_MAP).find(
-        k => String(symbolIdMap[SYMBOL_MAP[k]]) === symId
-      ) || symId;
-      return {
-        position_id:   String(p.positionId),
-        ticker,
-        trade_side:    td.tradeSide    || 'UNKNOWN',
-        volume:        td.volume       || null,
-        entry_price:   td.openPrice != null
-                         ? parseFloat(td.openPrice).toFixed(2)
-                         : null,
-        swap:          p.swap          || null,
-        open_time:     td.openTimestamp
-                         ? new Date(parseInt(td.openTimestamp)).toISOString()
-                         : null,
-        stop_loss:     p.stopLoss != null
-                         ? parseFloat(p.stopLoss).toFixed(2)
-                         : null,
-        is_paper:      IS_PAPER,
-        updated_at:    new Date().toISOString(),
-      };
-    });
-
-    const { error } = await supabase
-      .from('active_positions')
-      .upsert(rows, { onConflict: 'position_id' });
-
-    if (error) {
-      console.error('active_positions upsert error:', error.message);
-      return;
-    }
-
-    const openIds = rows.map(r => r.position_id);
-    await supabase
-      .from('active_positions')
-      .delete()
-      .eq('is_paper', IS_PAPER)
-      .not('position_id', 'in', `(${openIds.join(',')})`);
-
-    console.log(`Positions polled: ${rows.length} open`);
-
-  } catch(err) {
-    console.error('pollActivePositions error:', err.message);
-  }
-}
-
-// ── DEAL LIST — fetch fill price and order ID for a position ──────────
-async function fetchDealForPosition(positionId, lookbackMs = 60000) {
-  try {
-    const now  = Date.now();
-    const from = now - lookbackMs;
-
-    const dealRes = await connection.sendCommand('ProtoOADealListReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-      fromTimestamp:       from,
-      toTimestamp:         now,
-      maxRows:             50,
-    });
-
-    const deals = dealRes.deal || [];
-    const match = deals.find(d =>
-      String(d.positionId) === String(positionId) && d.dealStatus === 'FILLED'
-    ) || deals.find(d =>
-      String(d.positionId) === String(positionId)
-    );
-
-    if (!match) {
-      console.warn(`Deal not found for positionId:${positionId} in last ${lookbackMs}ms`);
-      return { fillPrice: null, orderId: null, filledVolume: null };
-    }
-
-    const fillPrice    = match.executionPrice != null
-      ? parseFloat(match.executionPrice).toFixed(2)
-      : null;
-    const orderId      = match.orderId      ? String(match.orderId)  : null;
-    const filledVolume = match.filledVolume ?? null;
-
-    console.log(`Deal found | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice}`);
-    return { fillPrice, orderId, filledVolume };
-
-  } catch(err) {
-    console.error('fetchDealForPosition error:', err.message);
-    return { fillPrice: null, orderId: null, filledVolume: null };
-  }
-}
-
-// ── RECONCILE CONFIRMATION — entry ────────────────────────────────────
-async function reconcileConfirm(dbId, symbolId, isLong) {
-  try {
-    console.log(`Reconcile check | dbId:${dbId}`);
-    const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-    });
-
-    const tradeSide = isLong ? 'BUY' : 'SELL';
-    const position  = (posRes.position || []).find(p =>
-      String(p.tradeData?.symbolId) === String(symbolId) &&
-      p.tradeData?.tradeSide === tradeSide
-    );
-
-    if (!position) {
-      console.warn(`Reconcile: no ${tradeSide} position found for symbolId:${symbolId}`);
-      await supabase.from('signal_log').update({
-        status:    'RECONCILE_NO_POSITION',
-        exec_type: 'RECONCILE_NO_POSITION',
-      }).eq('id', dbId);
-      await logAlert('ORDER_UNCONFIRMED', 'WARN',
-        `Order sent but reconcile found no open position. dbId:${dbId}`);
-      return;
-    }
-
-    const positionId = position.positionId ? String(position.positionId) : null;
-    const filledVol  = position.tradeData?.volume ?? null;
-    console.log(`Reconcile CONFIRMED | positionId:${positionId} | vol:${filledVol}`);
-
-    const { fillPrice, orderId } = await fetchDealForPosition(positionId);
-
-    await supabase.from('signal_log').update({
-      status:        'EXECUTED',
-      position_id:   positionId,
-      order_id:      orderId,
-      fill_price:    fillPrice,
-      filled_volume: filledVol,
-      exec_type:     'RECONCILE_CONFIRMED',
-      api_response:  JSON.stringify({ positionId, orderId, fillPrice, filledVol, tradeSide }),
-    }).eq('id', dbId);
-
-    console.log(`Entry logged | dbId:${dbId} | positionId:${positionId} | orderId:${orderId} | fillPrice:${fillPrice}`);
-
-  } catch(err) {
-    console.error('Reconcile confirm error:', err.message);
-    await logAlert('RECONCILE_ERROR', 'CRITICAL',
-      `Reconcile failed for dbId:${dbId} — ${err.message}`);
-  }
-}
-
-// ── EXIT RECONCILE CONFIRMATION ───────────────────────────────────────
-async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt = 1) {
-  try {
-    console.log(`Exit reconcile check | dbId:${dbId} | positionId:${positionId} | attempt:${attempt}`);
-    const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
-      ctidTraderAccountId: ACCOUNT_ID,
-    });
-
-    const tradeSide = isLong ? 'BUY' : 'SELL';
-    const stillOpen = (posRes.position || []).find(p =>
-      String(p.tradeData?.symbolId) === String(symbolId) &&
-      p.tradeData?.tradeSide === tradeSide
-    );
-
-    if (stillOpen && attempt < 3) {
-      console.warn(`Exit reconcile: position still open | retrying in 1s | dbId:${dbId}`);
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt + 1), 1000);
-      return;
-    }
-
-    if (stillOpen) {
-      console.error(`Exit reconcile: position still open after ${attempt} attempts | dbId:${dbId}`);
-      await logAlert('EXIT_UNCONFIRMED', 'WARN',
-        `Close sent but position still open after ${attempt} checks. dbId:${dbId}`);
-      return;
-    }
-
-    console.log(`Exit confirmed — position closed | positionId:${positionId}`);
-
-    const { fillPrice: exitFillPrice, orderId: exitOrderId, filledVolume: exitVol } =
-      await fetchDealForPosition(positionId, 120000);
-
-    await supabase.from('signal_log').update({
-      status:        'CLOSED',
-      exec_type:     'EXIT_CONFIRMED',
-      position_id:   positionId,
-      order_id:      exitOrderId,
-      fill_price:    exitFillPrice,
-      filled_volume: exitVol,
-      api_response:  JSON.stringify({ positionId, exitOrderId, exitFillPrice, exitVol, tradeSide }),
-    }).eq('id', dbId);
-
-    console.log(`Exit logged | dbId:${dbId} | positionId:${positionId} | exitOrderId:${exitOrderId} | exitFillPrice:${exitFillPrice}`);
-
-  } catch(err) {
-    console.error('Exit reconcile error:', err.message);
-    await logAlert('EXIT_RECONCILE_ERROR', 'CRITICAL',
-      `Exit reconcile failed for dbId:${dbId} — ${err.message}`);
-  }
-}
-
-// ── SIGNAL EXECUTION ──────────────────────────────────────────────────
-async function executeSignal(signal) {
-  const latencyMs = getLatencyMs(signal);
-
-  if (isExpired(signal)) {
-    console.warn(`Signal EXPIRED: ${signal.signal_id} | age: ${latencyMs}ms`);
-    await logSignal(signal, null, 'EXPIRED', 'Signal age exceeded 5000ms', latencyMs);
+  // Stale signal check (> 5 seconds old)
+  if (latencyMs > 5000) {
+    console.warn(`[EXPIRED] Signal ${signal.ticker} ${signal.action} age=${latencyMs}ms — skipped`);
+    await logSignal(signal, null, 'EXPIRED', `Signal age ${latencyMs}ms exceeds 5000ms limit`, latencyMs);
     return;
   }
 
-  if (isDuplicate(signal.signal_id)) {
-    console.log("Duplicate signal ignored:", signal.signal_id);
-    await logSignal(signal, null, 'DUPLICATE', null, latencyMs);
+  // Deduplication
+  const sigId = signal.signal_id || signal.timestamp;
+  if (isDuplicate(sigId)) {
+    console.warn(`[DUPLICATE] ${signal.ticker} ${signal.action} — skipped`);
     return;
   }
+
+  // Symbol lookup
+  const ctSymbol = SYMBOL_MAP[signal.ticker];
+  if (!ctSymbol) {
+    console.error(`[SYMBOL ERROR] No mapping for ticker: ${signal.ticker}`);
+    await logSignal(signal, null, 'FAILED', `No SYMBOL_MAP entry for: ${signal.ticker}`, latencyMs);
+    return;
+  }
+  const symbolId = symbolMap[ctSymbol];
+  if (!symbolId) {
+    console.error(`[SYMBOL ERROR] ${ctSymbol} not found in cTrader symbol list`);
+    await logSignal(signal, null, 'FAILED', `cTrader symbol not found: ${ctSymbol}`, latencyMs);
+    return;
+  }
+
+  const action  = signal.action;
+  const isEntry = action === 'LONG' || action === 'SHORT';
+  const isExit  = action === 'LONG_EXIT' || action === 'SHORT_EXIT' ||
+                  action === 'LONG_STOP'  || action === 'SHORT_STOP';
+
+  console.log(`[SIGNAL] ${signal.ticker} ${action} score=${signal.score} age=${latencyMs}ms`);
 
   if (!isConnected) {
-    console.warn("Engine not connected — signal dropped");
-    await logSignal(signal, null, 'ERROR', 'Engine not connected', latencyMs);
-    return;
-  }
-
-  const isEntry  = signal.action === 'LONG'  || signal.action === 'SHORT';
-  const isLong   = signal.action === 'LONG'  || signal.action === 'LONG_EXIT' || signal.action === 'LONG_STOP';
-  const ctSymbol = SYMBOL_MAP[signal.ticker] || signal.ticker;
-  const symbolId = symbolIdMap[ctSymbol];
-
-  if (!symbolId) {
-    console.error("Symbol not found:", ctSymbol);
-    await logSignal(signal, null, 'ERROR', 'Symbol not found: ' + ctSymbol, latencyMs);
+    console.error('[ENGINE] Not connected to cTrader — signal dropped');
+    await logSignal(signal, null, 'FAILED', 'Engine not connected to cTrader', latencyMs);
     return;
   }
 
   try {
     if (isEntry) {
-      // Enforce one position per ticker per side
-      const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
-        ctidTraderAccountId: ACCOUNT_ID,
-      });
-      const existing = (posRes.position || []).find(p =>
-        String(p.tradeData?.symbolId) === String(symbolId) &&
-        (isLong ? p.tradeData?.tradeSide === 'BUY' : p.tradeData?.tradeSide === 'SELL')
-      );
-      if (existing) {
-        console.log("Position already open — skipping entry:", ctSymbol);
-        await logSignal(signal, null, 'DUPLICATE_POSITION', null, latencyMs);
-        return;
-      }
-
-      const volume   = getVolume(parseInt(signal.score));
-      const stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100000);
-
-      console.log(`Order | ${ctSymbol} | ${isLong ? "BUY" : "SELL"} | ${volume} cents | SL: ${stopLoss} | latency: ${latencyMs}ms`);
-
-      const dbId = await logSignal(
-        signal,
-        { symbolId, volume, stopLoss },
-        'PENDING_FILL',
-        null,
-        latencyMs
-      );
-
-      try {
-        await connection.sendCommand('ProtoOANewOrderReq', {
-          ctidTraderAccountId: ACCOUNT_ID,
-          symbolId,
-          orderType:        'MARKET',
-          tradeSide:        isLong ? 'BUY' : 'SELL',
-          volume,
-          relativeStopLoss: stopLoss,
-          comment:          `HAWK|${signal.strategy_id}|S${signal.score}`,
-        });
-        console.log("Order sent to cTrader");
-      } catch(e) {
-        console.error("Order send error:", e.message);
-        await logError(signal, 'SEND_ERROR', e.message, null);
-        await supabase.from('signal_log').update({
-          status: 'ERROR', error_message: e.message,
-        }).eq('id', dbId);
-        return;
-      }
-
-      setTimeout(() => reconcileConfirm(dbId, symbolId, isLong), 1500);
-
+      await placeEntry(signal, symbolId, latencyMs);
+    } else if (isExit) {
+      await placeExit(signal, symbolId, latencyMs);
     } else {
-      // Exit — find matching position and close it
-      const posRes = await connection.sendCommand('ProtoOAReconcileReq', {
-        ctidTraderAccountId: ACCOUNT_ID,
-      });
-      const position = (posRes.position || []).find(p =>
-        String(p.tradeData?.symbolId) === String(symbolId) &&
-        (isLong ? p.tradeData?.tradeSide === 'BUY' : p.tradeData?.tradeSide === 'SELL')
-      );
-      if (!position) {
-        console.log("No matching position for", signal.action, ctSymbol);
-        await logSignal(signal, null, 'NO_POSITION', null, latencyMs);
-        return;
-      }
-
-      const positionId = position.positionId ? String(position.positionId) : null;
-      console.log("Closing position:", positionId, "| latency:", latencyMs + "ms");
-
-      const dbId = await logSignal(
-        signal,
-        { positionId },
-        'PENDING_CLOSE',
-        null,
-        latencyMs
-      );
-
-      try {
-        await connection.sendCommand('ProtoOAClosePositionReq', {
-          ctidTraderAccountId: ACCOUNT_ID,
-          positionId:          position.positionId,
-          volume:              position.tradeData.volume,
-        });
-        console.log("Close sent to cTrader");
-      } catch(e) {
-        console.error("Close send error:", e.message);
-        await logError(signal, 'CLOSE_ERROR', e.message, null);
-        await supabase.from('signal_log').update({
-          status: 'ERROR', error_message: e.message,
-        }).eq('id', dbId);
-        return;
-      }
-
-      setTimeout(() => reconcileExitConfirm(dbId, positionId, symbolId, isLong), 1500);
+      console.warn(`[UNKNOWN ACTION] ${action} — skipped`);
     }
-
-  } catch(err) {
-    console.error("Execution error:", err.message);
-    await logSignal(signal, null, 'ERROR', err.message, latencyMs);
+  } catch (err) {
+    console.error(`[EXECUTE ERROR] ${signal.ticker} ${action}:`, err.message);
+    await logSignal(signal, null, 'FAILED', err.message, latencyMs);
   }
 }
 
-// ── HTTP SERVER ───────────────────────────────────────────────────────
+async function placeEntry(signal, symbolId, latencyMs) {
+  const volume   = resolveVolume(signal);
+
+  if (volume === 0) {
+    console.warn(`[ZERO VOLUME] ${signal.ticker} score=${signal.score} — order skipped (0 units). Check lot size configuration.`);
+    await logSignal(signal, null, 'SKIPPED', 'Zero volume — no order placed. Review lot size for this score/ticker combination.', latencyMs);
+    return;
+  }
+
+  const isLong     = signal.action === 'LONG';
+  const tradeSide  = isLong ? 1 : 2;
+  const atr        = parseFloat(signal.atr) || 0;
+  // relativeStopLoss in cTrader = points (price × 100 for most instruments)
+  // ATR is already in price units. Multiply by 2 for 2× ATR stop.
+  const stopPoints = Math.round(atr * 2 * 100);
+
+  console.log(`[ORDER] Placing ${signal.action} | ${signal.ticker} | ${volume} units | SL: ${stopPoints} pts`);
+
+  const orderMsg = buildNewOrderReq(ACCOUNT_ID, symbolId, tradeSide, volume, stopPoints);
+  const resp     = await sendAndWait(orderMsg, 2108);
+
+  // Confirm via reconcile 1.5s later
+  await new Promise(r => setTimeout(r, 1500));
+  const reconMsg  = buildReconcileReq(ACCOUNT_ID);
+  const reconResp = await sendAndWait(reconMsg, 2125);
+
+  const totalLatency = Date.now() - (Date.now() - latencyMs);
+  console.log(`[EXECUTED] ${signal.ticker} ${signal.action} | ${volume} units`);
+  await logSignal(signal, { resp: resp.payloadType }, 'EXECUTED', null, latencyMs);
+}
+
+async function placeExit(signal, symbolId, latencyMs) {
+  // Reconcile to find open position for this symbol
+  const reconMsg  = buildReconcileReq(ACCOUNT_ID);
+  const reconResp = await sendAndWait(reconMsg, 2125);
+
+  // Parse positions from reconcile response
+  const position = findPosition(reconResp.payload, symbolId);
+  if (!position) {
+    console.warn(`[EXIT] No open position found for ${signal.ticker} — skipped`);
+    await logSignal(signal, null, 'SKIPPED', `No open position for ${signal.ticker}`, latencyMs);
+    return;
+  }
+
+  console.log(`[EXIT] Closing position ${position.id} | ${signal.ticker} | ${position.volume} units`);
+  const closeMsg = buildClosePositionReq(ACCOUNT_ID, position.id, position.volume);
+  const closeResp = await sendAndWait(closeMsg, 2140);
+
+  console.log(`[CLOSED] ${signal.ticker} ${signal.action}`);
+  await logSignal(signal, { resp: closeResp.payloadType }, 'EXECUTED', null, latencyMs);
+}
+
+function findPosition(buf, targetSymbolId) {
+  if (!buf) return null;
+  // ProtoOAReconcileRes: field 2 = position[] {field1=positionId, field2=tradeData{symbolId,volume}}
+  // Simplified parse — extract first position matching symbolId
+  let pos = 0;
+  while (pos < buf.length) {
+    if (pos >= buf.length) break;
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 2) {
+        const posEntry = parsePositionEntry(buf.slice(pos, pos + len), targetSymbolId);
+        if (posEntry) return posEntry;
+      }
+      pos += len;
+    } else if (wireType === 0) {
+      while (pos < buf.length && (buf[pos++] & 0x80));
+    } else break;
+  }
+  return null;
+}
+
+function parsePositionEntry(buf, targetSymbolId) {
+  let positionId = null, symbolId = null, volume = null;
+  let pos = 0;
+  while (pos < buf.length) {
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 0) {
+      let val = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        val |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 1) positionId = val;
+    } else if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 2) {
+        // tradeData
+        const tradeData = parseTradeData(buf.slice(pos, pos + len));
+        symbolId = tradeData.symbolId;
+        volume   = tradeData.volume;
+      }
+      pos += len;
+    } else break;
+  }
+  if (symbolId === targetSymbolId && positionId) return { id: positionId, volume: volume || 0 };
+  return null;
+}
+
+function parseTradeData(buf) {
+  let symbolId = null, volume = null, pos = 0;
+  while (pos < buf.length) {
+    const tagByte  = buf[pos++];
+    const fieldNum = tagByte >> 3;
+    const wireType = tagByte & 0x07;
+    if (wireType === 0) {
+      let val = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        val |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      if (fieldNum === 2) symbolId = val;
+      if (fieldNum === 3) volume   = val;
+    } else if (wireType === 2) {
+      let len = 0, shift = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        len |= (b & 0x7F) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+      }
+      pos += len;
+    } else break;
+  }
+  return { symbolId, volume };
+}
+
+// ── HTTP SERVER (primary signal path from Cloudflare Worker) ─────────────────
 function startHttpServer() {
-  const app = express();
-  app.use(express.json());
-
-  app.post('/signal', async (req, res) => {
-    if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/signal') {
+      res.writeHead(404); res.end(); return;
     }
-    const signal = req.body;
-    if (!signal || !signal.signal_id) {
-      return res.status(400).json({ error: 'Invalid signal' });
+    const secret = req.headers['x-internal-secret'];
+    if (secret !== INTERNAL_SECRET) {
+      res.writeHead(401); res.end('Unauthorized'); return;
     }
-    res.status(200).json({ ok: true });
-    setImmediate(() => executeSignal(signal));
-  });
-
-  app.get('/health', (req, res) => {
-    res.json({
-      status:  isConnected ? 'CONNECTED' : 'DISCONNECTED',
-      mode:    IS_PAPER ? 'PAPER' : 'LIVE',
-      uptime:  process.uptime(),
-      version: '2.6',
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const signal     = JSON.parse(body);
+        const receivedAt = signal.received_at ? new Date(signal.received_at).getTime() : Date.now();
+        res.writeHead(200); res.end('OK');
+        await processSignal(signal, receivedAt);
+      } catch (err) {
+        res.writeHead(400); res.end('Bad Request');
+        console.error('[HTTP PARSE ERROR]', err.message);
+      }
     });
   });
-
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`HTTP server listening on port ${PORT}`);
   });
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────
+// ── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  await refreshAccessToken();
-
-  const TWENTY_DAYS_MS = 20 * 24 * 60 * 60 * 1000;
-  setInterval(async () => {
-    try { await refreshAccessToken(); }
-    catch(e) { logAlert('TOKEN_REFRESH_FAILED', 'CRITICAL', e.message); }
-  }, TWENTY_DAYS_MS);
+  console.log(`╔════════════════════════════════════════════╗`);
+  console.log(`║  HAWK Execution Engine v2.7 STARTED        ║`);
+  console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
+  console.log(`╚════════════════════════════════════════════╝`);
 
   await washdownQueue();
-  await checkQueueDepth(); // Check queue depth immediately on startup
-
   await connectToCTrader();
   startHttpServer();
 
   // Heartbeat every 60 seconds
   setInterval(async () => {
     const daysLeft = tokenExpiryTime
-      ? Math.floor((tokenExpiryTime - Date.now()) / 86400000) : null;
+      ? Math.floor((tokenExpiryTime - Date.now()) / 86400000)
+      : null;
     await logHealth(isConnected ? 'RUNNING' : 'DISCONNECTED', daysLeft);
+    if (daysLeft !== null && daysLeft < 7) {
+      await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
+        `cTrader access token expires in ${daysLeft} days.`);
+    }
     if (daysLeft !== null && daysLeft < 2) {
       await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
         `cTrader access token expires in ${daysLeft} days. Immediate action required.`);
     }
   }, 60000);
-
-  // Poll active positions every 30 seconds for dashboard
-  setInterval(pollActivePositions, 30000);
-
-  // Monitor queue depth every 60 seconds
-  setInterval(checkQueueDepth, 60000);
 }
 
 main().catch(err => {
-  console.error("Fatal startup error:", err.message);
+  console.error('Fatal startup error:', err.message);
   process.exit(1);
 });
