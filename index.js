@@ -1,10 +1,11 @@
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║  HAWK EXECUTION ENGINE  —  index.js  v2.8                       ║
-// ║  Changes vs v2.7:                                                ║
-// ║  - buildProtoMessage: corrected field 1/2 (was 3/5)             ║
-// ║  - All builder functions: restored buildProtoMessage() call      ║
-// ║    (comma operator bug — was returning raw body only)            ║
-// ║  - handleIncomingMessage: corrected field 1/2 (was 3/5)         ║
+// ║  HAWK EXECUTION ENGINE  —  index.js  v2.9                       ║
+// ║  Changes vs v2.8:                                                ║
+// ║  - Inner message payloads now include payloadType as field 1     ║
+// ║    per official Spotware proto definition (all other fields +1)  ║
+// ║  - relativeStopLoss corrected to field 15 (was 14)              ║
+// ║  - closePositionReq volume corrected to field 4 (was 3)         ║
+// ║  - Auth steps now verify response payloadType before continuing  ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 'use strict';
@@ -27,8 +28,8 @@ const CT_HOST  = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ── TOKEN MANAGEMENT ──────────────────────────────────────────────────────────
-let accessToken    = null;
-let tokenExpiry    = 0;
+let accessToken     = null;
+let tokenExpiry     = 0;
 let tokenExpiryTime = null;
 
 async function getAccessToken() {
@@ -68,9 +69,7 @@ const SYMBOL_MAP = {
 // ── VOLUME FALLBACK ───────────────────────────────────────────────────────────
 // Primary path: lot_size from Pine Script payload (lot_size × 100 = units).
 // Fallback: hardcoded lookup below.
-//
 // ⚠ NAS100 score 7 returns 0 units — cTrader will reject a zero-volume order.
-//   Verify this is intentional before going live.
 function getVolume(score, ticker) {
   const s = parseInt(score);
   switch (ticker) {
@@ -184,7 +183,7 @@ function encodeField(fieldNum, wireType, value) {
   throw new Error('Unsupported wire type: ' + wireType);
 }
 
-// ProtoMessage wrapper — field 1 = payloadType (varint), field 2 = payload (bytes)
+// Outer ProtoMessage wrapper — field 1 = payloadType, field 2 = payload bytes
 function buildProtoMessage(payloadType, payload) {
   const payloadTypeField = encodeField(1, 0, payloadType);
   const payloadField     = encodeField(2, 2, payload);
@@ -194,61 +193,77 @@ function buildProtoMessage(payloadType, payload) {
   return Buffer.concat([lengthBuf, message]);
 }
 
-// ProtoOAApplicationAuthReq  (payloadType 2100)
+// ── MESSAGE BUILDERS ──────────────────────────────────────────────────────────
+// Per the Spotware proto definition, each inner message includes payloadType
+// as field 1. All data fields therefore start at field 2.
+
+// ProtoOAApplicationAuthReq (payloadType 2100)
 function buildAppAuthReq(clientId, clientSecret) {
   const body = Buffer.concat([
-    encodeField(1, 2, clientId),
-    encodeField(2, 2, clientSecret),
+    encodeField(1, 0, 2100),
+    encodeField(2, 2, clientId),
+    encodeField(3, 2, clientSecret),
   ]);
   return buildProtoMessage(2100, body);
 }
 
-// ProtoOAAccountAuthReq  (payloadType 2102)
+// ProtoOAAccountAuthReq (payloadType 2102)
 function buildAccountAuthReq(accountId, accessToken) {
   const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 2, accessToken),
+    encodeField(1, 0, 2102),
+    encodeField(2, 0, accountId),
+    encodeField(3, 2, accessToken),
   ]);
   return buildProtoMessage(2102, body);
 }
 
-// ProtoOASymbolsListReq  (payloadType 2115)
+// ProtoOASymbolsListReq (payloadType 2115)
 function buildSymbolsListReq(accountId) {
-  return buildProtoMessage(2115, encodeField(1, 0, accountId));
+  const body = Buffer.concat([
+    encodeField(1, 0, 2115),
+    encodeField(2, 0, accountId),
+  ]);
+  return buildProtoMessage(2115, body);
 }
 
-// ProtoOANewOrderReq  (payloadType 2106)
+// ProtoOANewOrderReq (payloadType 2106)
 function buildNewOrderReq(accountId, symbolId, tradeSide, volume, relativeStopLoss) {
   const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 0, symbolId),
-    encodeField(3, 0, 1),                  // orderType = MARKET
-    encodeField(4, 0, tradeSide),           // 1 = BUY, 2 = SELL
-    encodeField(5, 0, volume),
-    encodeField(14, 0, relativeStopLoss),
+    encodeField(1,  0, 2106),
+    encodeField(2,  0, accountId),
+    encodeField(3,  0, symbolId),
+    encodeField(4,  0, 1),               // orderType = MARKET
+    encodeField(5,  0, tradeSide),        // 1 = BUY, 2 = SELL
+    encodeField(6,  0, volume),
+    encodeField(15, 0, relativeStopLoss),
   ]);
   return buildProtoMessage(2106, body);
 }
 
-// ProtoOAReconcileReq  (payloadType 2124)
+// ProtoOAReconcileReq (payloadType 2124)
 function buildReconcileReq(accountId) {
-  return buildProtoMessage(2124, encodeField(1, 0, accountId));
+  const body = Buffer.concat([
+    encodeField(1, 0, 2124),
+    encodeField(2, 0, accountId),
+  ]);
+  return buildProtoMessage(2124, body);
 }
 
-// ProtoOAClosePositionReq  (payloadType 2139)
+// ProtoOAClosePositionReq (payloadType 2139)
 function buildClosePositionReq(accountId, positionId, volume) {
   const body = Buffer.concat([
-    encodeField(1, 0, accountId),
-    encodeField(2, 0, positionId),
-    encodeField(3, 0, volume),
+    encodeField(1, 0, 2139),
+    encodeField(2, 0, accountId),
+    encodeField(3, 0, positionId),
+    encodeField(4, 0, volume),
   ]);
   return buildProtoMessage(2139, body);
 }
 
-// ── TCP CONNECTION ────────────────────────────────────────────────────────────
-let socket        = null;
-let isConnected   = false;
-let symbolMap     = {};
+// ── TLS CONNECTION ────────────────────────────────────────────────────────────
+let socket         = null;
+let isConnected    = false;
+let symbolMap      = {};
 let pendingResolve = null;
 let pendingReject  = null;
 let receiveBuffer  = Buffer.alloc(0);
@@ -257,17 +272,25 @@ function connectToCTrader() {
   return new Promise((resolve, reject) => {
     console.log(`Connecting to cTrader (${CT_HOST}:5035)...`);
     socket = tls.connect(5035, CT_HOST, { rejectUnauthorized: true }, async () => {
-      console.log('TCP connected. Authenticating application...');
+      console.log('TLS connected. Authenticating application...');
       try {
         const token = await getAccessToken();
         tokenExpiryTime = tokenExpiry;
 
-        // 1. App auth
-        await sendAndWait(buildAppAuthReq(CTRADER_CLIENT_ID, CTRADER_SECRET), 2101);
+        // 1. App auth — expect 2101
+        const appResp = await sendAndWait(buildAppAuthReq(CTRADER_CLIENT_ID, CTRADER_SECRET), 2101);
+        console.log(`App auth response payloadType: ${appResp.payloadType}`);
+        if (appResp.payloadType !== 2101) {
+          throw new Error(`App auth failed — server returned payloadType ${appResp.payloadType}`);
+        }
         console.log('Application authenticated');
 
-        // 2. Account auth
-        await sendAndWait(buildAccountAuthReq(ACCOUNT_ID, token), 2103);
+        // 2. Account auth — expect 2103
+        const acctResp = await sendAndWait(buildAccountAuthReq(ACCOUNT_ID, token), 2103);
+        console.log(`Account auth response payloadType: ${acctResp.payloadType}`);
+        if (acctResp.payloadType !== 2103) {
+          throw new Error(`Account auth failed — server returned payloadType ${acctResp.payloadType}`);
+        }
         console.log(`Account authenticated: ${ACCOUNT_ID}`);
 
         // 3. Load symbols
@@ -279,6 +302,7 @@ function connectToCTrader() {
         await logHealth('RUNNING');
         resolve();
       } catch (err) {
+        console.error('[AUTH ERROR]', err.message);
         reject(err);
       }
     });
@@ -289,14 +313,14 @@ function connectToCTrader() {
     });
 
     socket.on('error', async (err) => {
-      console.error('[TCP ERROR]', err.message);
+      console.error('[TLS ERROR]', err.message);
       isConnected = false;
       await logHealth('DISCONNECTED');
       scheduleReconnect();
     });
 
     socket.on('close', async () => {
-      console.warn('[TCP CLOSED] Scheduling reconnect...');
+      console.warn('[TLS CLOSED] Scheduling reconnect...');
       isConnected = false;
       await logHealth('DISCONNECTED');
       scheduleReconnect();
@@ -330,7 +354,7 @@ function processReceiveBuffer() {
   }
 }
 
-// Parse incoming ProtoMessage — field 1 = payloadType, field 2 = payload
+// Outer ProtoMessage: field 1 = payloadType (varint), field 2 = payload (bytes)
 function handleIncomingMessage(buf) {
   let payloadType = null;
   let payload     = null;
@@ -349,7 +373,7 @@ function handleIncomingMessage(buf) {
         if (!(b & 0x80)) break;
         shift += 7;
       }
-      if (fieldNum === 1) payloadType = val;   // field 1 = payloadType
+      if (fieldNum === 1) payloadType = val;
     } else if (wireType === 2) {
       let len = 0, shift = 0;
       while (pos < buf.length) {
@@ -360,7 +384,7 @@ function handleIncomingMessage(buf) {
       }
       const data = buf.slice(pos, pos + len);
       pos += len;
-      if (fieldNum === 2) payload = data;      // field 2 = payload
+      if (fieldNum === 2) payload = data;
     } else {
       break;
     }
@@ -375,10 +399,8 @@ function handleIncomingMessage(buf) {
 
 function sendAndWait(msg, expectedType) {
   return new Promise((resolve, reject) => {
-    pendingResolve = (resp) => {
-      resolve(resp);
-    };
-    pendingReject = reject;
+    pendingResolve = (resp) => { resolve(resp); };
+    pendingReject  = reject;
     socket.write(msg);
     setTimeout(() => {
       if (pendingReject) {
@@ -540,8 +562,8 @@ async function placeEntry(signal, symbolId, latencyMs) {
 
   console.log(`[ORDER] ${signal.action} | ${signal.ticker} | ${volume} units | SL: ${stopPoints} pts`);
 
-  const orderMsg  = buildNewOrderReq(ACCOUNT_ID, symbolId, tradeSide, volume, stopPoints);
-  const resp      = await sendAndWait(orderMsg, 2108);
+  const orderMsg = buildNewOrderReq(ACCOUNT_ID, symbolId, tradeSide, volume, stopPoints);
+  const resp     = await sendAndWait(orderMsg, 2108);
 
   await new Promise(r => setTimeout(r, 1500));
   await sendAndWait(buildReconcileReq(ACCOUNT_ID), 2125);
@@ -561,7 +583,9 @@ async function placeExit(signal, symbolId, latencyMs) {
   }
 
   console.log(`[EXIT] Closing position ${position.id} | ${signal.ticker} | ${position.volume} units`);
-  const closeResp = await sendAndWait(buildClosePositionReq(ACCOUNT_ID, position.id, position.volume), 2140);
+  const closeResp = await sendAndWait(
+    buildClosePositionReq(ACCOUNT_ID, position.id, position.volume), 2140
+  );
 
   console.log(`[CLOSED] ${signal.ticker} ${signal.action}`);
   await logSignal(signal, { resp: closeResp.payloadType }, 'EXECUTED', null, latencyMs);
@@ -688,7 +712,7 @@ function startHttpServer() {
 // ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`╔════════════════════════════════════════════╗`);
-  console.log(`║  HAWK Execution Engine v2.8 STARTED        ║`);
+  console.log(`║  HAWK Execution Engine v2.9 STARTED        ║`);
   console.log(`║  Mode: ${IS_PAPER ? 'PAPER (safe to test)    ' : 'LIVE  — REAL MONEY!    '}  ║`);
   console.log(`╚════════════════════════════════════════════╝`);
 
