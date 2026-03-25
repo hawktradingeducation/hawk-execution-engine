@@ -60,7 +60,7 @@ const SYMBOL_MAP = {
   'NAS100':    'NAS100',
   'GER40':     'GER40',
   'AUS200':    'AUS200',
-  'SPOTBRENT': 'SPOTBRENT',
+  'SPOTBRENT': 'SpotBrent',
 };
 
 let symbolIdMap = {};
