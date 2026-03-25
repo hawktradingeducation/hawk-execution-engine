@@ -9,7 +9,7 @@
 // ║  - LONG_MKT_CLOSE / SHORT_MKT_CLOSE added to exit handler       ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
-'use strict';
+'use strict'; 
 
 const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
