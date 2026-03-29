@@ -273,7 +273,7 @@ async function querySymbolSchedules() {
       var ticker   = symbolIdToTicker[String(s.symbolId)] || 'UNKNOWN';
       var sessions = [];
       var rawSchedule = null;
-      console.log('[SCHEDULE RAW]', ticker, JSON.stringify(Object.keys(s)));
+      console.log('[SCHEDULE RAW]', ticker, JSON.stringify(s.schedule));
       
       try {
         rawSchedule = s.schedule || null;
@@ -413,7 +413,10 @@ async function connectToCTrader() {
       logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader connection closed. Reconnecting...');
       setTimeout(connectToCTrader, 3000);
     });
-
+    
+    console.log('Library prototype methods:', 
+    Object.getOwnPropertyNames(Object.getPrototypeOf(connection))
+      .filter(m => m !== 'constructor').join(', '));
     connection.on('error', function(err) {
       console.error('cTrader connection error:', err.message);
       isConnected = false;
