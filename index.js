@@ -273,7 +273,8 @@ async function querySymbolSchedules() {
       var ticker   = symbolIdToTicker[String(s.symbolId)] || 'UNKNOWN';
       var sessions = [];
       var rawSchedule = null;
-
+      console.log('[SCHEDULE RAW]', ticker, JSON.stringify(Object.keys(s)));
+      
       try {
         rawSchedule = s.schedule || null;
         var intervals = (s.schedule && s.schedule.intervals) || [];
@@ -387,7 +388,7 @@ function attachExecutionEventListener() {
     }
   });
 
-  console.log('ProtoOAExecutionEvent listener attached');
+console.log('ProtoOAExecutionEvent listener attached — supported events:', Object.keys(connection._events || {}).join(', '));
 }
 
 // ─── CONNECTION ───────────────────────────────────────────────────────────────
