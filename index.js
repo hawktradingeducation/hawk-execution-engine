@@ -277,7 +277,7 @@ async function querySymbolSchedules() {
       
       try {
         rawSchedule = s.schedule || null;
-        var intervals = (s.schedule && s.schedule.intervals) || [];
+        var intervals = Array.isArray(s.schedule) ? s.schedule : [];
         intervals.forEach(function(iv) {
           sessions.push(secondsToHuman(iv.startSecond) + ' → ' + secondsToHuman(iv.endSecond));
         });
