@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.13 STARTING ===');
+console.log('=== HAWK ENGINE v2.14 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -67,13 +67,39 @@ const SYMBOL_MAP = {
   'SPOTBRENT': 'SpotBrent',
 };
 
-let symbolIdMap      = {};
-let symbolIdToTicker = {};
+// ─── STOP DISTANCE POINT MULTIPLIERS ─────────────────────────────────────────
+// Converts stop_distance (price units from Pine Script payload) into
+// cTrader relativeStopLoss integer (points).
+// Formula: relativeStopLoss = stop_distance × multiplier
+//
+// cTrader point value = 1 / (10 ^ symbol digits).
+// Multiplier = 10 ^ symbol digits.
+//
+// XAUUSD  — 2 decimal places → ×100
+// XAGUSD  — 3 decimal places → ×1,000
+// BTCUSD  — 2 decimal places → ×100
+// ETHUSD  — 2 decimal places → ×100
+// NAS100  — 1 decimal place  → ×10
+// GER40   — 1 decimal place  → ×10
+// AUS200  — 1 decimal place  → ×10
+// SPOTBRENT — 3 decimal places → ×1,000
+//
+// NOTE: Verify these against Pepperstone's cTrader symbol specification if an
+// instrument's stop loss is being consistently rejected. The correct digits
+// value is visible in cTrader under Symbol Info → Digits.
+
+const STOP_POINT_MULTIPLIER = {
+  'XAUUSD':    100,
+  'XAGUSD':    1000,
+  'BTCUSD':    100,
+  'ETHUSD':    100,
+  'NAS100':    10,
+  'GER40':     10,
+  'AUS200':    10,
+  'SPOTBRENT': 1000,
+};
 
 // ─── PENDING ORDER REGISTRY ───────────────────────────────────────────────────
-// Maps symbolId:tradeSide → { dbId, registeredAt }
-// Allows the execution event listener to match broker events back to
-// the originating signal_log row without orderId storage.
 
 var pendingOrders = {};
 
@@ -133,6 +159,39 @@ function resolveVolume(signal) {
   const units = getVolume(signal.score, signal.ticker);
   console.log('[VOLUME] fallback: score=' + signal.score + ' ticker=' + signal.ticker + ' = ' + units + ' units');
   return units;
+}
+
+// ─── STOP LOSS CALCULATION ────────────────────────────────────────────────────
+// Primary: use stop_distance from v5.0.8 payload (Kijun-based structural stop).
+// Fallback: atr × 2 (legacy behaviour — fires only if stop_distance absent).
+// Both paths convert to cTrader integer points using per-instrument multiplier.
+
+function resolveStopLoss(signal) {
+  var ticker     = signal.ticker;
+  var multiplier = STOP_POINT_MULTIPLIER[ticker] || 100;
+
+  if (signal.stop_distance !== undefined &&
+      signal.stop_distance !== null &&
+      signal.stop_distance !== '') {
+    var dist = parseFloat(signal.stop_distance);
+    if (!isNaN(dist) && dist > 0) {
+      var stopPoints = Math.round(dist * multiplier);
+      console.log('[STOP] payload stop_distance:', dist,
+        '| multiplier:', multiplier,
+        '| cTrader points:', stopPoints,
+        '| ticker:', ticker);
+      return stopPoints;
+    }
+  }
+
+  // Fallback — legacy atr × 2 path
+  var atr        = parseFloat(signal.atr) || 0;
+  var stopPoints = Math.round(atr * 2 * multiplier);
+  console.log('[STOP] FALLBACK atr×2:', atr * 2,
+    '| multiplier:', multiplier,
+    '| cTrader points:', stopPoints,
+    '| ticker:', ticker);
+  return stopPoints;
 }
 
 // ─── SIGNAL HELPERS ───────────────────────────────────────────────────────────
@@ -243,9 +302,6 @@ async function logAlert(alertType, severity, message) {
 }
 
 // ─── SYMBOL SCHEDULE QUERY ────────────────────────────────────────────────────
-// Queries ProtoOASymbolByIdReq for all 8 tracked instruments on startup.
-// Converts cTrader session format (seconds from Monday midnight UTC) into
-// human-readable strings and persists to symbol_schedules table.
 
 var DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -311,10 +367,6 @@ async function querySymbolSchedules() {
 }
 
 // ─── EXECUTION EVENT LISTENER ─────────────────────────────────────────────────
-// Primary order confirmation mechanism. Listens for ProtoOAExecutionEvent
-// pushed by cTrader for every fill, rejection, cancellation, or expiry.
-// Updates signal_log with definitive status and fill_price / rejection_reason.
-// reconcileConfirm() is retained as a 2000ms fallback only.
 
 function attachExecutionEventListener() {
   connection.on('ProtoOAExecutionEvent', async function(event) {
@@ -388,7 +440,7 @@ function attachExecutionEventListener() {
     }
   });
 
-console.log('ProtoOAExecutionEvent listener attached — supported events:', Object.keys(connection._events || {}).join(', '));
+  console.log('ProtoOAExecutionEvent listener attached');
 }
 
 // ─── CONNECTION ───────────────────────────────────────────────────────────────
@@ -396,6 +448,8 @@ console.log('ProtoOAExecutionEvent listener attached — supported events:', Obj
 let connection   = null;
 let isConnected  = false;
 let reconnecting = false;
+let symbolIdMap      = {};
+let symbolIdToTicker = {};
 
 async function connectToCTrader() {
   if (reconnecting) return;
@@ -413,10 +467,7 @@ async function connectToCTrader() {
       logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader connection closed. Reconnecting...');
       setTimeout(connectToCTrader, 3000);
     });
-    
-    console.log('Library prototype methods:', 
-    Object.getOwnPropertyNames(Object.getPrototypeOf(connection))
-      .filter(m => m !== 'constructor').join(', '));
+
     connection.on('error', function(err) {
       console.error('cTrader connection error:', err.message);
       isConnected = false;
@@ -425,7 +476,6 @@ async function connectToCTrader() {
     await connection.open();
     console.log('Connected to cTrader');
 
-    // Attach listener immediately after connection — before auth — so no events are missed
     attachExecutionEventListener();
 
     await connection.sendCommand('ProtoOAApplicationAuthReq', {
@@ -464,9 +514,8 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.13 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.14 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
-    // Non-blocking — runs after ENGINE READY
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
     });
@@ -505,8 +554,6 @@ async function washdownQueue() {
 }
 
 // ─── RECONCILE FALLBACK ───────────────────────────────────────────────────────
-// Fires 2000ms after order submission. If the execution event has already
-// resolved the row, this exits immediately. Otherwise polls once as a safety net.
 
 async function reconcileConfirm(dbId, symbolId, isLong) {
   try {
@@ -648,7 +695,9 @@ async function executeSignal(signal) {
         return;
       }
 
-      var volume = resolveVolume(signal);
+      var volume   = resolveVolume(signal);
+      var stopLoss = resolveStopLoss(signal);
+
       if (volume === 0) {
         console.warn('[ZERO VOLUME]', signal.ticker, 'score=' + signal.score, '— order skipped');
         await logSignal(signal, null, 'SKIPPED',
@@ -656,9 +705,8 @@ async function executeSignal(signal) {
         return;
       }
 
-      var stopLoss = Math.round(parseFloat(signal.atr) * 2 * 100000);
       console.log('Order |', ctSymbol, '|', tradeSide, '|', volume,
-        'units | SL:', stopLoss, '| latency:', latencyMs + 'ms');
+        'units | SL:', stopLoss, 'pts | latency:', latencyMs + 'ms');
 
       var dbId = await logSignal(
         signal,
@@ -688,7 +736,6 @@ async function executeSignal(signal) {
         return;
       }
 
-      // Reconcile fallback at 2000ms — exits immediately if execution event arrived first
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
 
     } else if (isExit) {
@@ -764,7 +811,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.13',
+      version:       '2.14',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
