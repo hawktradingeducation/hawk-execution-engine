@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.19 STARTING ===');
+console.log('=== HAWK ENGINE v2.20 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -530,27 +530,35 @@ async function connectToCTrader() {
     });
     console.log('Application authenticated');
 
-    // ── ACCOUNT ENUMERATION ──────────────────────────────────────────────────
-    // Queries all accounts linked to this access token via the Open API socket.
-    // Logs ctidTraderAccountId alongside broker login so the correct ID can be
-    // identified for the CTRADER_ACCOUNT_ID Railway variable.
+    // ── ACCOUNT BALANCE DIAGNOSTIC ───────────────────────────────────────────
+    // Queries the paper account details including balance.
+    // A zero balance would silently reject all orders.
     try {
-      var accListRes = await connection.sendCommand('ProtoOAGetAccountListByAccessTokenReq', {
-        accessToken: currentAccessToken,
+      var traderRes = await connection.sendCommand('ProtoOATraderReq', {
+        ctidTraderAccountId: ACCOUNT_ID,
       });
-      var accList = accListRes.ctidTraderAccount || [];
-      console.log('=== ACCESS TOKEN ACCOUNTS (' + accList.length + ' found) ===');
-      accList.forEach(function(acc) {
-        console.log('[ACCOUNT]',
-          'ctidTraderAccountId:', acc.ctidTraderAccountId,
-          '| traderLogin (broker account):', acc.traderLogin || 'unknown',
-          '| isLive:', acc.isLive,
-          '| depositCurrency:', acc.depositCurrency || 'unknown',
-          '| balance:', acc.balance !== undefined ? (acc.balance / 100) : 'unknown');
-      });
-      console.log('=== END ACCOUNTS | CURRENT ACCOUNT_ID IN USE:', ACCOUNT_ID, '===');
-    } catch (accErr) {
-      console.warn('[ACCOUNT ENUM] Failed:', accErr.message);
+      var trader = traderRes.trader || {};
+      var balance     = trader.balance     !== undefined ? (trader.balance / 100)     : 'unknown';
+      var equity      = trader.equity      !== undefined ? (trader.equity / 100)      : 'unknown';
+      var freeMargin  = trader.freeMargin  !== undefined ? (trader.freeMargin / 100)  : 'unknown';
+      var currency    = trader.depositAsset ? (trader.depositAsset.name || 'unknown') : 'unknown';
+      var leverageVal = trader.leverageInCents !== undefined ? (trader.leverageInCents / 100) : 'unknown';
+      console.log('[ACCOUNT BALANCE]',
+        'balance:', balance,
+        '| equity:', equity,
+        '| freeMargin:', freeMargin,
+        '| currency:', currency,
+        '| leverage:', leverageVal,
+        '| brokerName:', trader.brokerName || 'unknown',
+        '| accountType:', trader.accountType || 'unknown',
+        '| isLive:', trader.isLive);
+      if (balance !== 'unknown' && balance <= 0) {
+        console.error('[ACCOUNT BALANCE] WARNING: Balance is zero or negative — orders will be rejected!');
+        await logAlert('ZERO_BALANCE', 'CRITICAL',
+          'Paper account balance is ' + balance + '. Orders will be rejected. Please reset the paper account.');
+      }
+    } catch (balErr) {
+      console.warn('[ACCOUNT BALANCE] Query failed:', balErr.message);
     }
     // ────────────────────────────────────────────────────────────────────────
 
@@ -584,7 +592,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.19 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.20 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -787,14 +795,15 @@ async function executeSignal(signal) {
       if (dbId) registerPending(symbolId, tradeSide, dbId);
 
       try {
+        // v2.20 DIAGNOSTIC — bare minimum order: no stop loss, no comment
+        // Cleanest possible test to confirm if order placement works at all.
+        // Stop loss and comment will be restored once execution is confirmed.
         var orderRes = await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId:            symbolId,
           orderType:           'MARKET',
           tradeSide:           tradeSide,
           volume:              volume,
-          relativeStopLoss:    stopLoss,
-          comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
 
         // Log full response — executionType tells us if this was accepted or rejected
@@ -908,7 +917,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.19',
+      version:       '2.20',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
