@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.15 STARTING ===');
+console.log('=== HAWK ENGINE v2.16 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -72,9 +72,6 @@ const SYMBOL_MAP = {
 // cTrader relativeStopLoss integer (points).
 // Formula: relativeStopLoss = stop_distance × multiplier
 //
-// cTrader point value = 1 / (10 ^ symbol digits).
-// Multiplier = 10 ^ symbol digits.
-//
 // XAUUSD  — 2 decimal places → ×100
 // XAGUSD  — 3 decimal places → ×1,000
 // BTCUSD  — 2 decimal places → ×100
@@ -83,10 +80,6 @@ const SYMBOL_MAP = {
 // GER40   — 1 decimal place  → ×10
 // AUS200  — 1 decimal place  → ×10
 // SPOTBRENT — 3 decimal places → ×1,000
-//
-// NOTE: Verify these against Pepperstone's cTrader symbol specification if an
-// instrument's stop loss is being consistently rejected. The correct digits
-// value is visible in cTrader under Symbol Info → Digits.
 
 const STOP_POINT_MULTIPLIER = {
   'XAUUSD':    100,
@@ -164,7 +157,6 @@ function resolveVolume(signal) {
 // ─── STOP LOSS CALCULATION ────────────────────────────────────────────────────
 // Primary: use stop_distance from v5.0.8 payload (Kijun-based structural stop).
 // Fallback: atr × 2 (legacy behaviour — fires only if stop_distance absent).
-// Both paths convert to cTrader integer points using per-instrument multiplier.
 
 function resolveStopLoss(signal) {
   var ticker     = signal.ticker;
@@ -184,7 +176,6 @@ function resolveStopLoss(signal) {
     }
   }
 
-  // Fallback — legacy atr × 2 path
   var atr        = parseFloat(signal.atr) || 0;
   var stopPoints = Math.round(atr * 2 * multiplier);
   console.log('[STOP] FALLBACK atr×2:', atr * 2,
@@ -330,7 +321,7 @@ async function querySymbolSchedules() {
       var sessions = [];
       var rawSchedule = null;
       console.log('[SCHEDULE RAW]', ticker, JSON.stringify(s.schedule));
-      
+
       try {
         rawSchedule = s.schedule || null;
         var intervals = Array.isArray(s.schedule) ? s.schedule : [];
@@ -363,6 +354,61 @@ async function querySymbolSchedules() {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('Symbol schedule query failed:', msg);
     await logAlert('SCHEDULE_QUERY_FAILED', 'WARN', msg);
+  }
+}
+
+// ─── DEAL LIST DIAGNOSTIC ─────────────────────────────────────────────────────
+// Queries cTrader for deals in the last 30 seconds.
+// Called after every order submission to confirm whether cTrader recorded
+// any execution. If deals appear, the order executed and the execution event
+// listener is not working. If deals are empty, cTrader rejected the order.
+
+async function queryRecentDeals(ctSymbol, dbId) {
+  try {
+    var toTs   = Date.now();
+    var fromTs = toTs - 30000;
+    var res    = await connection.sendCommand('ProtoOADealListReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+      fromTimestamp:       fromTs,
+      toTimestamp:         toTs,
+      maxRows:             10,
+    });
+    var deals = res.deal || [];
+    if (deals.length === 0) {
+      console.warn('[DEAL LIST] No deals found in last 30s for', ctSymbol,
+        '— order was likely rejected by cTrader | dbId:', dbId);
+      await supabase.from('signal_log')
+        .update({
+          status:        'REJECTED',
+          error_message: 'No deal recorded by cTrader within 30s — order rejected silently',
+        })
+        .eq('id', dbId);
+      await logAlert('ORDER_SILENT_REJECT', 'WARN',
+        ctSymbol + ' order sent but no deal recorded by cTrader. dbId:' + dbId
+        + ' — check stop loss distance and minimum stop requirements.');
+    } else {
+      console.log('[DEAL LIST] Deals found after order:', JSON.stringify(deals));
+      var deal = deals[0];
+      var fillPrice = deal.executionPrice ? deal.executionPrice / 100000 : null;
+      console.log('[DEAL LIST] CONFIRMED EXECUTION | dealId:', deal.dealId,
+        '| fillPrice:', fillPrice,
+        '| status:', deal.dealStatus,
+        '| dbId:', dbId);
+      await supabase.from('signal_log')
+        .update({
+          status:       'EXECUTED',
+          fill_price:   fillPrice,
+          api_response: JSON.stringify({
+            dealId:         deal.dealId,
+            executionPrice: fillPrice,
+            dealStatus:     deal.dealStatus,
+            source:         'deal_list_query',
+          }),
+        })
+        .eq('id', dbId);
+    }
+  } catch (err) {
+    console.error('[DEAL LIST] Query error:', err.message);
   }
 }
 
@@ -439,13 +485,7 @@ function attachExecutionEventListener() {
       console.error('[EXEC EVENT] Handler error:', (err && err.message) ? err.message : err);
     }
   });
-  
-var _emit = connection.emit.bind(connection);
-connection.emit = function(eventName) {
-  console.log('[DIAG] Event emitted:', eventName);
-  return _emit.apply(this, arguments);
-};
-  
+
   console.log('ProtoOAExecutionEvent listener attached');
 }
 
@@ -520,7 +560,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.15 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.16 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -570,7 +610,7 @@ async function reconcileConfirm(dbId, symbolId, isLong) {
       .single();
 
     if (row && (row.status === 'EXECUTED' || row.status === 'REJECTED')) {
-      console.log('[RECONCILE] dbId:' + dbId + ' already resolved by execution event ('
+      console.log('[RECONCILE] dbId:' + dbId + ' already resolved ('
         + row.status + ') — skipping');
       return;
     }
@@ -732,7 +772,14 @@ async function executeSignal(signal) {
           relativeStopLoss:    stopLoss,
           comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
-        console.log('[ORDER RESPONSE] cTrader replied:', JSON.stringify(orderRes));
+
+        // Log full response — executionType tells us if this was accepted or rejected
+        var orderResKeys = orderRes ? Object.keys(orderRes) : [];
+        console.log('[ORDER RESPONSE] keys:', orderResKeys.join(',') || 'EMPTY',
+          '| executionType:', (orderRes && orderRes.executionType) || 'none',
+          '| errorCode:', (orderRes && orderRes.errorCode) || 'none',
+          '| full:', JSON.stringify(orderRes));
+
       } catch (e) {
         console.error('[ORDER ERROR] cTrader rejected order:', e.message,
           '| ticker:', ctSymbol,
@@ -749,8 +796,8 @@ async function executeSignal(signal) {
           })
           .eq('id', dbId);
         await logAlert('ORDER_REJECTED', 'WARN',
-          ctSymbol + ' ' + tradeSide + ' rejected by cTrader. '
-          + 'Error: ' + e.message
+          ctSymbol + ' ' + tradeSide + ' rejected by cTrader.'
+          + ' Error: ' + e.message
           + (e.errorCode ? ' | Code: ' + e.errorCode : '')
           + ' | volume: ' + volume
           + ' | stopLoss: ' + stopLoss + 'pts'
@@ -758,7 +805,11 @@ async function executeSignal(signal) {
         return;
       }
 
+      // Reconcile fallback at 2000ms
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
+
+      // Deal list diagnostic at 4000ms — confirms whether cTrader recorded an execution
+      setTimeout(function() { queryRecentDeals(ctSymbol, dbId); }, 4000);
 
     } else if (isExit) {
       var posRes2  = await connection.sendCommand('ProtoOAReconcileReq', {
@@ -833,7 +884,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.15',
+      version:       '2.16',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
