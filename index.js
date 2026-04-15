@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.16 STARTING ===');
+console.log('=== HAWK ENGINE v2.17 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -560,7 +560,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.16 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.17 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -763,13 +763,14 @@ async function executeSignal(signal) {
       if (dbId) registerPending(symbolId, tradeSide, dbId);
 
       try {
+        // v2.17 DIAGNOSTIC — relativeStopLoss removed to confirm it is causing silent rejection
+        // RESTORE IN v2.18 once confirmed. Do not use in production without stop loss.
         var orderRes = await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId:            symbolId,
           orderType:           'MARKET',
           tradeSide:           tradeSide,
           volume:              volume,
-          relativeStopLoss:    stopLoss,
           comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
 
@@ -884,7 +885,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.16',
+      version:       '2.17',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
