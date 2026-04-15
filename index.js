@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.17 STARTING ===');
+console.log('=== HAWK ENGINE v2.18 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -530,6 +530,27 @@ async function connectToCTrader() {
     });
     console.log('Application authenticated');
 
+    // ── ACCOUNT ENUMERATION ──────────────────────────────────────────────────
+    // Lists all ctidTraderAccountId values associated with this access token.
+    // Use this output to identify the correct CTRADER_ACCOUNT_ID for Railway.
+    try {
+      var tokenAccounts = await CTraderConnection.getAccessTokenAccounts(currentAccessToken);
+      console.log('=== ACCESS TOKEN ACCOUNTS ===');
+      (tokenAccounts || []).forEach(function(acc) {
+        console.log('[ACCOUNT]',
+          'ctidTraderAccountId:', acc.ctidTraderAccountId,
+          '| brokerName:', acc.brokerName || 'unknown',
+          '| brokerAccountId:', acc.brokerAccountId || 'unknown',
+          '| isLive:', acc.isLive,
+          '| depositCurrency:', acc.depositCurrency || 'unknown',
+          '| balance:', acc.balance !== undefined ? (acc.balance / 100) : 'unknown');
+      });
+      console.log('=== END ACCOUNTS | CURRENT ACCOUNT_ID:', ACCOUNT_ID, '===');
+    } catch (accErr) {
+      console.warn('[ACCOUNT ENUM] Failed:', accErr.message);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     await connection.sendCommand('ProtoOAAccountAuthReq', {
       ctidTraderAccountId: ACCOUNT_ID,
       accessToken:         currentAccessToken,
@@ -560,7 +581,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.17 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.18 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -763,14 +784,13 @@ async function executeSignal(signal) {
       if (dbId) registerPending(symbolId, tradeSide, dbId);
 
       try {
-        // v2.17 DIAGNOSTIC — relativeStopLoss removed to confirm it is causing silent rejection
-        // RESTORE IN v2.18 once confirmed. Do not use in production without stop loss.
         var orderRes = await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId:            symbolId,
           orderType:           'MARKET',
           tradeSide:           tradeSide,
           volume:              volume,
+          relativeStopLoss:    stopLoss,
           comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
 
@@ -885,7 +905,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.17',
+      version:       '2.18',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
