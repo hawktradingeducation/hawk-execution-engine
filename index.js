@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.14 STARTING ===');
+console.log('=== HAWK ENGINE v2.15 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -514,7 +514,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.14 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.15 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -717,7 +717,7 @@ async function executeSignal(signal) {
       if (dbId) registerPending(symbolId, tradeSide, dbId);
 
       try {
-        await connection.sendCommand('ProtoOANewOrderReq', {
+        var orderRes = await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId:            symbolId,
           orderType:           'MARKET',
@@ -726,13 +726,29 @@ async function executeSignal(signal) {
           relativeStopLoss:    stopLoss,
           comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
-        console.log('Order sent to cTrader');
+        console.log('[ORDER RESPONSE] cTrader replied:', JSON.stringify(orderRes));
       } catch (e) {
-        console.error('Order send error:', e.message);
+        console.error('[ORDER ERROR] cTrader rejected order:', e.message,
+          '| ticker:', ctSymbol,
+          '| side:', tradeSide,
+          '| volume:', volume,
+          '| stopLoss:', stopLoss,
+          '| errorCode:', (e.errorCode || 'none'),
+          '| errorDescription:', (e.description || 'none'));
         if (dbId) resolvePending(symbolId, tradeSide);
         await supabase.from('signal_log')
-          .update({ status: 'ERROR', error_message: e.message })
+          .update({
+            status:        'ERROR',
+            error_message: e.message + (e.errorCode ? ' | code: ' + e.errorCode : ''),
+          })
           .eq('id', dbId);
+        await logAlert('ORDER_REJECTED', 'WARN',
+          ctSymbol + ' ' + tradeSide + ' rejected by cTrader. '
+          + 'Error: ' + e.message
+          + (e.errorCode ? ' | Code: ' + e.errorCode : '')
+          + ' | volume: ' + volume
+          + ' | stopLoss: ' + stopLoss + 'pts'
+          + ' | dbId: ' + dbId);
         return;
       }
 
@@ -811,7 +827,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.14',
+      version:       '2.15',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
