@@ -439,7 +439,13 @@ function attachExecutionEventListener() {
       console.error('[EXEC EVENT] Handler error:', (err && err.message) ? err.message : err);
     }
   });
-
+  
+var _emit = connection.emit.bind(connection);
+connection.emit = function(eventName) {
+  console.log('[DIAG] Event emitted:', eventName);
+  return _emit.apply(this, arguments);
+};
+  
   console.log('ProtoOAExecutionEvent listener attached');
 }
 
