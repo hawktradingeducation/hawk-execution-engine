@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.18 STARTING ===');
+console.log('=== HAWK ENGINE v2.19 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -531,21 +531,24 @@ async function connectToCTrader() {
     console.log('Application authenticated');
 
     // ── ACCOUNT ENUMERATION ──────────────────────────────────────────────────
-    // Lists all ctidTraderAccountId values associated with this access token.
-    // Use this output to identify the correct CTRADER_ACCOUNT_ID for Railway.
+    // Queries all accounts linked to this access token via the Open API socket.
+    // Logs ctidTraderAccountId alongside broker login so the correct ID can be
+    // identified for the CTRADER_ACCOUNT_ID Railway variable.
     try {
-      var tokenAccounts = await CTraderConnection.getAccessTokenAccounts(currentAccessToken);
-      console.log('=== ACCESS TOKEN ACCOUNTS ===');
-      (tokenAccounts || []).forEach(function(acc) {
+      var accListRes = await connection.sendCommand('ProtoOAGetAccountListByAccessTokenReq', {
+        accessToken: currentAccessToken,
+      });
+      var accList = accListRes.ctidTraderAccount || [];
+      console.log('=== ACCESS TOKEN ACCOUNTS (' + accList.length + ' found) ===');
+      accList.forEach(function(acc) {
         console.log('[ACCOUNT]',
           'ctidTraderAccountId:', acc.ctidTraderAccountId,
-          '| brokerName:', acc.brokerName || 'unknown',
-          '| brokerAccountId:', acc.brokerAccountId || 'unknown',
+          '| traderLogin (broker account):', acc.traderLogin || 'unknown',
           '| isLive:', acc.isLive,
           '| depositCurrency:', acc.depositCurrency || 'unknown',
           '| balance:', acc.balance !== undefined ? (acc.balance / 100) : 'unknown');
       });
-      console.log('=== END ACCOUNTS | CURRENT ACCOUNT_ID:', ACCOUNT_ID, '===');
+      console.log('=== END ACCOUNTS | CURRENT ACCOUNT_ID IN USE:', ACCOUNT_ID, '===');
     } catch (accErr) {
       console.warn('[ACCOUNT ENUM] Failed:', accErr.message);
     }
@@ -581,7 +584,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.18 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.19 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -905,7 +908,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.18',
+      version:       '2.19',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
