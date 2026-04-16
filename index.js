@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.22 STARTING ===');
+console.log('=== HAWK ENGINE v2.23 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -149,15 +149,18 @@ function resolveVolume(signal) {
       // XAUUSD/SPOTBRENT: 1 lot = 10,000 units (confirmed: 100 units = 0.01 lots)
       // ETHUSD/NAS100/GER40/AUS200: 1 lot = 100 units (confirmed: 100 units = 1 lot)
       // BTCUSD/XAGUSD: 1 lot = 100 units (inferred — 100 units caused margin rejection)
+      // LOT_SIZE = units per lot, derived empirically from Pepperstone paper account.
+      // Rule of thumb: 3 decimal place instruments (XAUUSD, XAGUSD, SPOTBRENT) = 10,000
+      //                2 decimal place / index instruments = 100
       const LOT_SIZE = {
         'XAUUSD':    10000,
+        'XAGUSD':    10000,
         'SPOTBRENT': 10000,
         'ETHUSD':    100,
         'NAS100':    100,
         'GER40':     100,
         'AUS200':    100,
         'BTCUSD':    100,
-        'XAGUSD':    100,
       };
       var lotSize = LOT_SIZE[signal.ticker] || 10000;
       const units = Math.round(lots * lotSize);
@@ -609,7 +612,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.22 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.23 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -934,7 +937,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.22',
+      version:       '2.23',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
