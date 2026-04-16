@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.24 STARTING ===');
+console.log('=== HAWK ENGINE v2.25 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -144,22 +144,8 @@ function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
-      // Per-instrument lot size map — units = lots × lotSize
-      // Derived empirically from Pepperstone cTrader paper account:
-      // XAUUSD/SPOTBRENT: 1 lot = 10,000 units (confirmed: 100 units = 0.01 lots)
-      // ETHUSD/NAS100/GER40/AUS200: 1 lot = 100 units (confirmed: 100 units = 1 lot)
-      // BTCUSD/XAGUSD: 1 lot = 100 units (inferred — 100 units caused margin rejection)
-      // LOT_SIZE = API units per lot, derived empirically from Pepperstone paper account.
-      // Confirmed values (lot_size sent → units → cTrader display):
-      // XAUUSD:    0.01 × 10,000 =   100 units = 0.01 lots ✓
-      // SPOTBRENT: 0.01 × 10,000 =   100 units = 0.01 lots ✓
-      // XAGUSD:    1.00 × 10,000 = 10,000 units = 0.02 lots → LOT_SIZE = 500,000
-      //            (5,000 troy oz/lot contract, 50× XAUUSD, proportionally finer units)
-      // ETHUSD:    0.01 ×    100 =   100 units = 1 lot ✓
-      // NAS100:    0.01 ×    100 =   100 units = 1 lot ✓
-      // GER40:     0.01 ×    100 =   100 units = 1 lot ✓
-      // AUS200:    0.01 ×    100 =   100 units = 1 lot ✓
-      // BTCUSD:    0.01 ×    100 =     1 unit  = 0.01 lots ✓
+      // Per-instrument lot size map — empirically confirmed on Pepperstone paper account.
+      // units = lots × LOT_SIZE
       const LOT_SIZE = {
         'XAUUSD':    10000,
         'XAGUSD':    500000,
@@ -558,38 +544,6 @@ async function connectToCTrader() {
     });
     console.log('Application authenticated');
 
-    // ── ACCOUNT BALANCE DIAGNOSTIC ───────────────────────────────────────────
-    // Queries the paper account details including balance.
-    // A zero balance would silently reject all orders.
-    try {
-      var traderRes = await connection.sendCommand('ProtoOATraderReq', {
-        ctidTraderAccountId: ACCOUNT_ID,
-      });
-      var trader = traderRes.trader || {};
-      var balance     = trader.balance     !== undefined ? (trader.balance / 100)     : 'unknown';
-      var equity      = trader.equity      !== undefined ? (trader.equity / 100)      : 'unknown';
-      var freeMargin  = trader.freeMargin  !== undefined ? (trader.freeMargin / 100)  : 'unknown';
-      var currency    = trader.depositAsset ? (trader.depositAsset.name || 'unknown') : 'unknown';
-      var leverageVal = trader.leverageInCents !== undefined ? (trader.leverageInCents / 100) : 'unknown';
-      console.log('[ACCOUNT BALANCE]',
-        'balance:', balance,
-        '| equity:', equity,
-        '| freeMargin:', freeMargin,
-        '| currency:', currency,
-        '| leverage:', leverageVal,
-        '| brokerName:', trader.brokerName || 'unknown',
-        '| accountType:', trader.accountType || 'unknown',
-        '| isLive:', trader.isLive);
-      if (balance !== 'unknown' && balance <= 0) {
-        console.error('[ACCOUNT BALANCE] WARNING: Balance is zero or negative — orders will be rejected!');
-        await logAlert('ZERO_BALANCE', 'CRITICAL',
-          'Paper account balance is ' + balance + '. Orders will be rejected. Please reset the paper account.');
-      }
-    } catch (balErr) {
-      console.warn('[ACCOUNT BALANCE] Query failed:', balErr.message);
-    }
-    // ────────────────────────────────────────────────────────────────────────
-
     await connection.sendCommand('ProtoOAAccountAuthReq', {
       ctidTraderAccountId: ACCOUNT_ID,
       accessToken:         currentAccessToken,
@@ -620,7 +574,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.24 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.25 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -823,23 +777,17 @@ async function executeSignal(signal) {
       if (dbId) registerPending(symbolId, tradeSide, dbId);
 
       try {
-        // v2.20 DIAGNOSTIC — bare minimum order: no stop loss, no comment
-        // Cleanest possible test to confirm if order placement works at all.
-        // Stop loss and comment will be restored once execution is confirmed.
         var orderRes = await connection.sendCommand('ProtoOANewOrderReq', {
           ctidTraderAccountId: ACCOUNT_ID,
           symbolId:            symbolId,
           orderType:           'MARKET',
           tradeSide:           tradeSide,
           volume:              volume,
+          relativeStopLoss:    stopLoss,
+          comment:             'HAWK|' + signal.strategy_id + '|S' + signal.score,
         });
-
-        // Log full response — executionType tells us if this was accepted or rejected
-        var orderResKeys = orderRes ? Object.keys(orderRes) : [];
-        console.log('[ORDER RESPONSE] keys:', orderResKeys.join(',') || 'EMPTY',
-          '| executionType:', (orderRes && orderRes.executionType) || 'none',
-          '| errorCode:', (orderRes && orderRes.errorCode) || 'none',
-          '| full:', JSON.stringify(orderRes));
+        console.log('[ORDER] Sent to cTrader | ticker:', ctSymbol,
+          '| side:', tradeSide, '| volume:', volume, '| stopLoss:', stopLoss, 'pts');
 
       } catch (e) {
         console.error('[ORDER ERROR] cTrader rejected order:', e.message,
@@ -945,7 +893,7 @@ function startHttpServer() {
       status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:          IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:        process.uptime(),
-      version:       '2.24',
+      version:       '2.25',
       pendingOrders: Object.keys(pendingOrders).length,
     });
   });
