@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.25 STARTING ===');
+console.log('=== HAWK ENGINE v2.27 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -144,8 +144,6 @@ function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
-      // Per-instrument lot size map — empirically confirmed on Pepperstone paper account.
-      // units = lots × LOT_SIZE
       const LOT_SIZE = {
         'XAUUSD':    10000,
         'XAGUSD':    500000,
@@ -169,8 +167,8 @@ function resolveVolume(signal) {
 }
 
 // ─── STOP LOSS CALCULATION ────────────────────────────────────────────────────
-// Primary: use stop_distance from v5.0.8 payload (Kijun-based structural stop).
-// Fallback: atr × 2 (legacy behaviour — fires only if stop_distance absent).
+// Primary: use stop_distance from payload (Kijun-based structural stop).
+// Fallback: atr × 2 (legacy — fires only if stop_distance absent).
 
 function resolveStopLoss(signal) {
   var ticker     = signal.ticker;
@@ -335,6 +333,15 @@ async function querySymbolSchedules() {
       var sessions = [];
       var rawSchedule = null;
       console.log('[SCHEDULE RAW]', ticker, JSON.stringify(s.schedule));
+      console.log('[SYMBOL SPEC]', ticker,
+        '| minStopLoss:', s.minStopLossDistance,
+        '| minVolume:', s.minVolume,
+        '| maxVolume:', s.maxVolume,
+        '| lotSize:', s.lotSize,
+        '| digits:', s.digits,
+        '| pipPosition:', s.pipPosition,
+        '| stepVolume:', s.stepVolume
+      );
 
       try {
         rawSchedule = s.schedule || null;
@@ -403,7 +410,7 @@ async function queryRecentDeals(ctSymbol, dbId) {
     } else {
       console.log('[DEAL LIST] Deals found after order:', JSON.stringify(deals));
       var deal = deals[0];
-      var fillPrice = deal.executionPrice ? deal.executionPrice / 100000 : null;
+      var fillPrice = deal.executionPrice ? deal.executionPrice : null;
       console.log('[DEAL LIST] CONFIRMED EXECUTION | dealId:', deal.dealId,
         '| fillPrice:', fillPrice,
         '| status:', deal.dealStatus,
@@ -503,6 +510,155 @@ function attachExecutionEventListener() {
   console.log('ProtoOAExecutionEvent listener attached');
 }
 
+// ─── STARTUP: CLOSE ALL OPEN POSITIONS ───────────────────────────────────────
+// On every engine startup, any positions left open from a prior session are
+// closed unconditionally. This prevents orphaned positions from running
+// unmonitored after a pipeline restart, crash, or redeployment.
+// Log: one signal_log record per position (action: STARTUP_CLOSE).
+// Alert: STARTUP_POSITIONS_CLOSED | WARN if closures made, INFO if none.
+
+async function closeAllOpenPositions() {
+  console.log('[STARTUP] Checking for open positions to close...');
+  try {
+    var posRes    = await connection.sendCommand('ProtoOAReconcileReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+    });
+    var positions = posRes.position || [];
+
+    if (positions.length === 0) {
+      console.log('[STARTUP] No open positions found.');
+      await logAlert('STARTUP_POSITIONS_CLOSED', 'INFO',
+        'Startup check: no open positions found.');
+      return;
+    }
+
+    console.log('[STARTUP] Found ' + positions.length + ' open position(s). Closing all...');
+    var closed = [];
+    var failed = [];
+
+    for (var p of positions) {
+      var symbolId   = p.tradeData && p.tradeData.symbolId ? String(p.tradeData.symbolId) : 'UNKNOWN';
+      var ticker     = symbolIdToTicker[symbolId] || symbolId;
+      var positionId = p.positionId ? String(p.positionId) : null;
+      var volume     = p.tradeData && p.tradeData.volume ? p.tradeData.volume : null;
+      var tradeSide  = p.tradeData && p.tradeData.tradeSide ? p.tradeData.tradeSide : null;
+
+      console.log('[STARTUP] Closing position | ticker:', ticker,
+        '| positionId:', positionId,
+        '| side:', tradeSide,
+        '| volume:', volume);
+
+      try {
+        await connection.sendCommand('ProtoOAClosePositionReq', {
+          ctidTraderAccountId: ACCOUNT_ID,
+          positionId:          p.positionId,
+          volume:              volume,
+        });
+
+        await supabase.from('signal_log').insert({
+          signal_id:     'STARTUP_CLOSE_' + positionId,
+          strategy_id:   'SYSTEM',
+          ticker:        ticker,
+          action:        'STARTUP_CLOSE',
+          score:         null,
+          atr:           null,
+          close_price:   null,
+          status:        'CLOSED',
+          error_message: null,
+          api_response:  JSON.stringify({ positionId: positionId, tradeSide: tradeSide, source: 'startup_close' }),
+          signal_time:   new Date().toISOString(),
+          processed_at:  new Date().toISOString(),
+          is_paper:      IS_PAPER,
+          latency_ms:    null,
+        });
+
+        closed.push(ticker);
+        console.log('[STARTUP] Closed:', ticker, '| positionId:', positionId);
+
+      } catch (e) {
+        var errMsg = (e && e.message) ? e.message : String(e);
+        console.error('[STARTUP] Failed to close position | ticker:', ticker,
+          '| positionId:', positionId, '| error:', errMsg);
+
+        await supabase.from('signal_log').insert({
+          signal_id:     'STARTUP_CLOSE_FAIL_' + positionId,
+          strategy_id:   'SYSTEM',
+          ticker:        ticker,
+          action:        'STARTUP_CLOSE',
+          score:         null,
+          atr:           null,
+          close_price:   null,
+          status:        'ERROR',
+          error_message: 'Startup close failed: ' + errMsg,
+          api_response:  null,
+          signal_time:   new Date().toISOString(),
+          processed_at:  new Date().toISOString(),
+          is_paper:      IS_PAPER,
+          latency_ms:    null,
+        });
+
+        failed.push(ticker);
+      }
+    }
+
+    var summary  = 'Startup close: ' + closed.length + ' closed'
+      + (closed.length > 0 ? ' (' + closed.join(', ') + ')' : '')
+      + (failed.length > 0 ? ' | ' + failed.length + ' FAILED (' + failed.join(', ') + ')' : '');
+    var severity = failed.length > 0 ? 'CRITICAL' : 'WARN';
+    await logAlert('STARTUP_POSITIONS_CLOSED', severity, summary);
+    console.log('[STARTUP]', summary);
+
+  } catch (err) {
+    var msg = (err && err.message) ? err.message : String(err);
+    console.error('[STARTUP] closeAllOpenPositions error:', msg);
+    await logAlert('STARTUP_CLOSE_ERROR', 'CRITICAL',
+      'Startup position close query failed: ' + msg);
+  }
+}
+
+// ─── WATCHDOG ────────────────────────────────────────────────────────────────
+// Sends a lightweight ProtoOAReconcileReq every 10 minutes to verify the
+// cTrader connection is genuinely functional, not just superficially alive.
+// The health endpoint reports isConnected=true even when the TCP connection
+// has silently degraded — this catches that case and forces a reconnect.
+
+async function runWatchdog() {
+  if (!isConnected || reconnecting) return;
+
+  try {
+    var timeoutMs = 8000;
+    var watchdogPromise = connection.sendCommand('ProtoOAReconcileReq', {
+      ctidTraderAccountId: ACCOUNT_ID,
+    });
+    var timeoutPromise = new Promise(function(_, reject) {
+      setTimeout(function() { reject(new Error('Watchdog timeout after 8s')); }, timeoutMs);
+    });
+
+    await Promise.race([watchdogPromise, timeoutPromise]);
+
+    lastWatchdogOk   = new Date().toISOString();
+    watchdogFailures = 0;
+    console.log('[WATCHDOG] OK | connection verified |', lastWatchdogOk);
+
+  } catch (err) {
+    watchdogFailures++;
+    var msg = (err && err.message) ? err.message : String(err);
+    console.error('[WATCHDOG] FAIL #' + watchdogFailures + ' |', msg);
+    await logAlert('WATCHDOG_FAIL', 'WARN',
+      'Watchdog failure #' + watchdogFailures + ': ' + msg);
+
+    if (watchdogFailures >= 2) {
+      console.error('[WATCHDOG] 2 consecutive failures — forcing reconnect');
+      await logAlert('WATCHDOG_RECONNECT', 'CRITICAL',
+        'Watchdog forced reconnect after ' + watchdogFailures + ' failures. isConnected was: ' + isConnected);
+      isConnected      = false;
+      reconnecting     = false;
+      watchdogFailures = 0;
+      connectToCTrader();
+    }
+  }
+}
+
 // ─── CONNECTION ───────────────────────────────────────────────────────────────
 
 let connection   = null;
@@ -510,6 +666,11 @@ let isConnected  = false;
 let reconnecting = false;
 let symbolIdMap      = {};
 let symbolIdToTicker = {};
+
+// ─── WATCHDOG STATE ───────────────────────────────────────────────────────────
+
+let lastWatchdogOk   = null;
+let watchdogFailures = 0;
 
 async function connectToCTrader() {
   if (reconnecting) return;
@@ -574,7 +735,13 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.25 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.27 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+
+    // Close any positions left open from prior session
+    await closeAllOpenPositions();
+
+    // Start watchdog: verify connection every 10 minutes
+    setInterval(runWatchdog, 10 * 60 * 1000);
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
@@ -817,7 +984,7 @@ async function executeSignal(signal) {
       // Reconcile fallback at 2000ms
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
 
-      // Deal list diagnostic at 4000ms — confirms whether cTrader recorded an execution
+      // Deal list diagnostic at 4000ms
       setTimeout(function() { queryRecentDeals(ctSymbol, dbId); }, 4000);
 
     } else if (isExit) {
@@ -889,12 +1056,19 @@ function startHttpServer() {
   });
 
   app.get('/health', function(req, res) {
+    var uptimeSecs  = process.uptime();
+    var watchdogAge = lastWatchdogOk
+      ? Math.round((Date.now() - new Date(lastWatchdogOk).getTime()) / 1000)
+      : null;
     res.json({
-      status:        isConnected ? 'CONNECTED' : 'DISCONNECTED',
-      mode:          IS_PAPER ? 'PAPER' : 'LIVE',
-      uptime:        process.uptime(),
-      version:       '2.25',
-      pendingOrders: Object.keys(pendingOrders).length,
+      status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
+      mode:             IS_PAPER ? 'PAPER' : 'LIVE',
+      uptime:           uptimeSecs,
+      version:          '2.27',
+      pendingOrders:    Object.keys(pendingOrders).length,
+      lastWatchdogOk:   lastWatchdogOk,
+      watchdogAgeS:     watchdogAge,
+      watchdogFailures: watchdogFailures,
     });
   });
 
