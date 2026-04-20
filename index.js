@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.29 STARTING ===');
+console.log('=== HAWK ENGINE v2.30 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -72,31 +72,26 @@ const SYMBOL_MAP = {
 
 // --- STOP DISTANCE POINT MULTIPLIERS -----------------------------------------
 // Converts stop_distance (price units from Pine Script payload) into
-// cTrader relativeStopLoss integer (points).
+// cTrader relativeStopLoss integer.
 // Formula: relativeStopLoss = stop_distance x multiplier
 //
-// Pine Script sends stop_distance in price units (e.g. $9.50 for gold).
-// cTrader relativeStopLoss requires points (1 point = 1 cent for 2dp instruments).
-// Each multiplier = (10 ^ digits) x 10 to correctly scale to cTrader points.
+// Empirically confirmed: 1 cTrader relativeStopLoss unit = 1e-05 price units
+// for all instruments regardless of decimal places.
+// Therefore: multiplier = 1 / 1e-05 = 100,000 universally.
 //
-// XAUUSD    -- 2dp -- x1,000
-// XAGUSD    -- 3dp -- x10,000
-// BTCUSD    -- 2dp -- x1,000
-// ETHUSD    -- 2dp -- x1,000
-// NAS100    -- 1dp -- x100
-// GER40     -- 1dp -- x100
-// AUS200    -- 1dp -- x100
-// SPOTBRENT -- 3dp -- x10,000
+// Example: XAUUSD stop_distance $9.50 -> relativeStopLoss 950,000 -> $9.50 SL
+// Example: BTCUSD stop_distance $167  -> relativeStopLoss 16,700,000 -> $167 SL
+// Example: NAS100 stop_distance 20pts -> relativeStopLoss 2,000,000 -> 20pt SL
 
 const STOP_POINT_MULTIPLIER = {
-  'XAUUSD':    1000,
-  'XAGUSD':    10000,
-  'BTCUSD':    1000,
-  'ETHUSD':    1000,
-  'NAS100':    100,
-  'GER40':     100,
-  'AUS200':    100,
-  'SPOTBRENT': 10000,
+  'XAUUSD':    100000,
+  'XAGUSD':    100000,
+  'BTCUSD':    100000,
+  'ETHUSD':    100000,
+  'NAS100':    100000,
+  'GER40':     100000,
+  'AUS200':    100000,
+  'SPOTBRENT': 100000,
 };
 
 // ─── PENDING ORDER REGISTRY ───────────────────────────────────────────────────
@@ -147,6 +142,15 @@ function getVolume(score, ticker) {
   }
 }
 
+// Minimum volumes enforced by cTrader (units, not lots).
+// NAS100/GER40/AUS200: minVolume=10, stepVolume=10 (= 0.1 lots minimum).
+// All others meet minimum at 0.01 lots.
+const MIN_VOLUME = {
+  'NAS100': 10,
+  'GER40':  10,
+  'AUS200': 10,
+};
+
 function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
@@ -162,7 +166,13 @@ function resolveVolume(signal) {
         'BTCUSD':    100,
       };
       var lotSize = LOT_SIZE[signal.ticker] || 10000;
-      const units = Math.round(lots * lotSize);
+      var units   = Math.round(lots * lotSize);
+      var minVol  = MIN_VOLUME[signal.ticker] || 0;
+      if (minVol > 0 && units < minVol) {
+        console.warn('[VOLUME] Calculated units', units, '< minVolume', minVol,
+          'for', signal.ticker, '— clamping to minVolume. lot_size sent:', lots);
+        units = minVol;
+      }
       console.log('[VOLUME] payload lot_size:', lots, 'lots | lotSize:', lotSize,
         '| units:', units, '| ticker:', signal.ticker);
       return units;
@@ -387,12 +397,10 @@ async function querySymbolSchedules() {
 }
 
 // ─── DEAL LIST DIAGNOSTIC ─────────────────────────────────────────────────────
-// Queries cTrader for deals in the last 30 seconds.
-// Called after every order submission to confirm whether cTrader recorded
-// any execution. If deals appear, the order executed and the execution event
-// listener is not working. If deals are empty, cTrader rejected the order.
+// Queries cTrader for deals in the last 30 seconds filtered by symbolId.
+// symbolId filter prevents false positives from other instruments' recent deals.
 
-async function queryRecentDeals(ctSymbol, dbId) {
+async function queryRecentDeals(ctSymbol, dbId, symbolId) {
   try {
     var toTs   = Date.now();
     var fromTs = toTs - 30000;
@@ -402,7 +410,10 @@ async function queryRecentDeals(ctSymbol, dbId) {
       toTimestamp:         toTs,
       maxRows:             10,
     });
-    var deals = res.deal || [];
+    var allDeals = res.deal || [];
+    var deals = symbolId
+      ? allDeals.filter(function(d) { return String(d.symbolId) === String(symbolId); })
+      : allDeals;
     if (deals.length === 0) {
       console.warn('[DEAL LIST] No deals found in last 30s for', ctSymbol,
         '— order was likely rejected by cTrader | dbId:', dbId);
@@ -423,6 +434,23 @@ async function queryRecentDeals(ctSymbol, dbId) {
         '| fillPrice:', fillPrice,
         '| status:', deal.dealStatus,
         '| dbId:', dbId);
+      await supabase.from('signal_log')
+        .update({
+          status:       'EXECUTED',
+          fill_price:   fillPrice,
+          api_response: JSON.stringify({
+            dealId:         deal.dealId,
+            executionPrice: fillPrice,
+            dealStatus:     deal.dealStatus,
+            source:         'deal_list_query',
+          }),
+        })
+        .eq('id', dbId);
+    }
+  } catch (err) {
+    console.error('[DEAL LIST] Query error:', err.message);
+  }
+}
       await supabase.from('signal_log')
         .update({
           status:       'EXECUTED',
@@ -743,7 +771,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.29 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.30 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     // Close any positions left open from prior session
     await closeAllOpenPositions();
@@ -758,7 +786,7 @@ async function connectToCTrader() {
     // 3C — STARTUP_COMPLETE timing log
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.29 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.30 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1017,7 +1045,7 @@ async function executeSignal(signal) {
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
 
       // Deal list diagnostic at 4000ms
-      setTimeout(function() { queryRecentDeals(ctSymbol, dbId); }, 4000);
+      setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId); }, 4000);
 
     } else if (isExit) {
       var posRes2  = await connection.sendCommand('ProtoOAReconcileReq', {
