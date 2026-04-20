@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.27 STARTING ===');
+console.log('=== HAWK ENGINE v2.28 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -46,6 +46,9 @@ async function refreshAccessToken() {
   tokenExpiryTime    = Date.now() + (data.expires_in * 1000);
   const daysLeft     = Math.floor(data.expires_in / 86400);
   console.log('Access token refreshed. Expires in', daysLeft, 'days');
+  // 3B — TOKEN_REFRESH_SUCCEEDED INFO alert
+  await logAlert('TOKEN_REFRESH_SUCCEEDED', 'INFO',
+    'Access token refreshed successfully. Expires in ' + daysLeft + ' days.');
   await logHealth('RUNNING', daysLeft);
   if (daysLeft < 7) {
     await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
@@ -293,6 +296,7 @@ async function logHealth(status, tokenDaysLeft) {
 async function logAlert(alertType, severity, message) {
   console.log('ALERT [' + severity + '] ' + alertType + ': ' + message);
   try {
+    // 3A — field name corrected: code → alert_type
     await supabase.from('alerts').insert({
       alert_type: alertType,
       severity,
@@ -735,7 +739,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.27 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.28 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     // Close any positions left open from prior session
     await closeAllOpenPositions();
@@ -746,6 +750,12 @@ async function connectToCTrader() {
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
     });
+
+    // 3C — STARTUP_COMPLETE timing log
+    var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
+    await logAlert('STARTUP_COMPLETE', 'INFO',
+      'Engine v2.28 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
@@ -871,6 +881,24 @@ async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt)
 
 async function executeSignal(signal) {
   var latencyMs = getLatencyMs(signal);
+
+  // 3D — Pipeline latency threshold alerting
+  if (latencyMs !== null && latencyMs > 3000) {
+    await logAlert('LATENCY_CRITICAL', 'CRITICAL',
+      'Signal latency ' + latencyMs + 'ms exceeds 3000ms threshold.'
+      + ' ticker: ' + (signal.ticker || 'UNKNOWN')
+      + ' | signal_id: ' + (signal.signal_id || 'UNKNOWN'));
+  } else if (latencyMs !== null && latencyMs > 1500) {
+    await logAlert('LATENCY_WARN', 'WARN',
+      'Signal latency ' + latencyMs + 'ms exceeds 1500ms threshold.'
+      + ' ticker: ' + (signal.ticker || 'UNKNOWN')
+      + ' | signal_id: ' + (signal.signal_id || 'UNKNOWN'));
+  } else if (latencyMs !== null && latencyMs > 500) {
+    await logAlert('LATENCY_ADVISORY', 'INFO',
+      'Signal latency ' + latencyMs + 'ms exceeds 500ms advisory threshold.'
+      + ' ticker: ' + (signal.ticker || 'UNKNOWN')
+      + ' | signal_id: ' + (signal.signal_id || 'UNKNOWN'));
+  }
 
   if (isExpired(signal)) {
     console.warn('Signal EXPIRED:', signal.signal_id, '| age:', latencyMs + 'ms');
@@ -1064,7 +1092,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.27',
+      version:          '2.28',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
@@ -1080,6 +1108,9 @@ function startHttpServer() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // 3C — capture engine start time for STARTUP_COMPLETE timing
+  global.engineStartMs = Date.now();
+
   await refreshAccessToken();
 
   setInterval(async function() {
