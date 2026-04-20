@@ -165,9 +165,9 @@ function resolveVolume(signal) {
         'AUS200':    100,
         'BTCUSD':    100,
       };
-      var lotSize = LOT_SIZE[signal.ticker] || 10000;
-      var units   = Math.round(lots * lotSize);
-      var minVol  = MIN_VOLUME[signal.ticker] || 0;
+      let lotSize = LOT_SIZE[signal.ticker] || 10000;
+      let units   = Math.round(lots * lotSize);
+      let minVol  = MIN_VOLUME[signal.ticker] || 0;
       if (minVol > 0 && units < minVol) {
         console.warn('[VOLUME] Calculated units', units, '< minVolume', minVol,
           'for', signal.ticker, '— clamping to minVolume. lot_size sent:', lots);
@@ -434,23 +434,6 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId) {
         '| fillPrice:', fillPrice,
         '| status:', deal.dealStatus,
         '| dbId:', dbId);
-      await supabase.from('signal_log')
-        .update({
-          status:       'EXECUTED',
-          fill_price:   fillPrice,
-          api_response: JSON.stringify({
-            dealId:         deal.dealId,
-            executionPrice: fillPrice,
-            dealStatus:     deal.dealStatus,
-            source:         'deal_list_query',
-          }),
-        })
-        .eq('id', dbId);
-    }
-  } catch (err) {
-    console.error('[DEAL LIST] Query error:', err.message);
-  }
-}
       await supabase.from('signal_log')
         .update({
           status:       'EXECUTED',
