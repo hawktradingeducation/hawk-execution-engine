@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.28 STARTING ===');
+console.log('=== HAWK ENGINE v2.29 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -70,29 +70,33 @@ const SYMBOL_MAP = {
   'SPOTBRENT': 'SpotBrent',
 };
 
-// ─── STOP DISTANCE POINT MULTIPLIERS ─────────────────────────────────────────
+// --- STOP DISTANCE POINT MULTIPLIERS -----------------------------------------
 // Converts stop_distance (price units from Pine Script payload) into
 // cTrader relativeStopLoss integer (points).
-// Formula: relativeStopLoss = stop_distance × multiplier
+// Formula: relativeStopLoss = stop_distance x multiplier
 //
-// XAUUSD  — 2 decimal places → ×100
-// XAGUSD  — 3 decimal places → ×1,000
-// BTCUSD  — 2 decimal places → ×100
-// ETHUSD  — 2 decimal places → ×100
-// NAS100  — 1 decimal place  → ×10
-// GER40   — 1 decimal place  → ×10
-// AUS200  — 1 decimal place  → ×10
-// SPOTBRENT — 3 decimal places → ×1,000
+// Pine Script sends stop_distance in price units (e.g. $9.50 for gold).
+// cTrader relativeStopLoss requires points (1 point = 1 cent for 2dp instruments).
+// Each multiplier = (10 ^ digits) x 10 to correctly scale to cTrader points.
+//
+// XAUUSD    -- 2dp -- x1,000
+// XAGUSD    -- 3dp -- x10,000
+// BTCUSD    -- 2dp -- x1,000
+// ETHUSD    -- 2dp -- x1,000
+// NAS100    -- 1dp -- x100
+// GER40     -- 1dp -- x100
+// AUS200    -- 1dp -- x100
+// SPOTBRENT -- 3dp -- x10,000
 
 const STOP_POINT_MULTIPLIER = {
-  'XAUUSD':    100,
-  'XAGUSD':    1000,
-  'BTCUSD':    100,
-  'ETHUSD':    100,
-  'NAS100':    10,
-  'GER40':     10,
-  'AUS200':    10,
-  'SPOTBRENT': 1000,
+  'XAUUSD':    1000,
+  'XAGUSD':    10000,
+  'BTCUSD':    1000,
+  'ETHUSD':    1000,
+  'NAS100':    100,
+  'GER40':     100,
+  'AUS200':    100,
+  'SPOTBRENT': 10000,
 };
 
 // ─── PENDING ORDER REGISTRY ───────────────────────────────────────────────────
@@ -739,7 +743,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.28 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.29 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     // Close any positions left open from prior session
     await closeAllOpenPositions();
@@ -754,7 +758,7 @@ async function connectToCTrader() {
     // 3C — STARTUP_COMPLETE timing log
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.28 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.29 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
