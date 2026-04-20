@@ -294,7 +294,7 @@ async function logAlert(alertType, severity, message) {
   console.log('ALERT [' + severity + '] ' + alertType + ': ' + message);
   try {
     await supabase.from('alerts').insert({
-      code:       alertType,
+      alert_type: alertType,
       severity,
       message,
       created_at: new Date().toISOString(),
