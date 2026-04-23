@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.31 STARTING ===');
+console.log('=== HAWK ENGINE v2.32 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -142,7 +142,7 @@ function getVolume(score, ticker) {
     case 'GER40':     return s >= 9 ? 150 : s >= 8 ? 100 : 50;
     case 'AUS200':    return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     case 'SPOTBRENT': return s >= 9 ? 200 : s >= 8 ? 150 : 100;
-    case 'GBPJPY':    return s >= 9 ? 4000 : s >= 8 ? 2000 : 1000;  // v2.31
+    case 'GBPJPY':    return s >= 9 ? 400000 : s >= 8 ? 200000 : 100000;  // v2.32 — 0.04/0.02/0.01 lots
     default:
       console.warn('[VOLUME] No rule for', ticker, '— defaulting to 1');
       return 1;
@@ -162,9 +162,12 @@ function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
-      // v2.31: GBPJPY added. LOT_SIZE = 100,000 (standard FX lot).
-      // 0.01 lots × 100,000 = 1,000 units.
-      // *** EMPIRICALLY UNVERIFIED — confirm on first paper trade. ***
+      // LOT_SIZE empirical values — units per lot in cTrader Open API.
+      // GBPJPY: empirically confirmed 23 Apr 2026.
+      //   lot_size=1.00 × 100,000 = 100,000 units → 0.01 lots in cTrader.
+      //   Therefore 0.01 lots = 100,000 units → 1 lot = 10,000,000 units.
+      //   LOT_SIZE = 10,000,000 ensures Pine payload 0.01/0.02/0.04 →
+      //   0.01/0.02/0.04 lots displayed in cTrader.
       const LOT_SIZE = {
         'XAUUSD':    10000,
         'XAGUSD':    500000,
@@ -174,7 +177,7 @@ function resolveVolume(signal) {
         'GER40':     100,
         'AUS200':    100,
         'BTCUSD':    100,
-        'GBPJPY':    100000,   // v2.31 — standard FX lot; verify empirically
+        'GBPJPY':    10000000,  // v2.32 — empirically confirmed
       };
       let lotSize = LOT_SIZE[signal.ticker] || 10000;
       let units   = Math.round(lots * lotSize);
@@ -749,7 +752,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.31 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.32 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     await closeAllOpenPositions();
 
@@ -761,7 +764,7 @@ async function connectToCTrader() {
 
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.31 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.32 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1095,7 +1098,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.31',
+      version:          '2.32',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
