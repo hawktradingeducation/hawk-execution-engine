@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.30 STARTING ===');
+console.log('=== HAWK ENGINE v2.31 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -46,7 +46,6 @@ async function refreshAccessToken() {
   tokenExpiryTime    = Date.now() + (data.expires_in * 1000);
   const daysLeft     = Math.floor(data.expires_in / 86400);
   console.log('Access token refreshed. Expires in', daysLeft, 'days');
-  // 3B — TOKEN_REFRESH_SUCCEEDED INFO alert
   await logAlert('TOKEN_REFRESH_SUCCEEDED', 'INFO',
     'Access token refreshed successfully. Expires in ' + daysLeft + ' days.');
   await logHealth('RUNNING', daysLeft);
@@ -58,6 +57,9 @@ async function refreshAccessToken() {
 }
 
 // ─── SYMBOL MAP ───────────────────────────────────────────────────────────────
+// v2.31: GBPJPY added.
+// NOTE: cTrader symbol string 'GBPJPY' assumed — verify in Pepperstone
+// cTrader symbol list on first deployment. If not found, check for 'GBP/JPY'.
 
 const SYMBOL_MAP = {
   'XAUUSD':    'XAUUSD',
@@ -68,6 +70,7 @@ const SYMBOL_MAP = {
   'GER40':     'GER40',
   'AUS200':    'AUS200',
   'SPOTBRENT': 'SpotBrent',
+  'GBPJPY':    'GBPJPY',       // v2.31 — verify exact cTrader symbol string
 };
 
 // --- STOP DISTANCE POINT MULTIPLIERS -----------------------------------------
@@ -78,10 +81,6 @@ const SYMBOL_MAP = {
 // Empirically confirmed: 1 cTrader relativeStopLoss unit = 1e-05 price units
 // for all instruments regardless of decimal places.
 // Therefore: multiplier = 1 / 1e-05 = 100,000 universally.
-//
-// Example: XAUUSD stop_distance $9.50 -> relativeStopLoss 950,000 -> $9.50 SL
-// Example: BTCUSD stop_distance $167  -> relativeStopLoss 16,700,000 -> $167 SL
-// Example: NAS100 stop_distance 20pts -> relativeStopLoss 2,000,000 -> 20pt SL
 
 const STOP_POINT_MULTIPLIER = {
   'XAUUSD':    100000,
@@ -92,6 +91,7 @@ const STOP_POINT_MULTIPLIER = {
   'GER40':     100000,
   'AUS200':    100000,
   'SPOTBRENT': 100000,
+  'GBPJPY':    100000,         // v2.31
 };
 
 // ─── PENDING ORDER REGISTRY ───────────────────────────────────────────────────
@@ -124,6 +124,12 @@ setInterval(function() {
 }, 30000);
 
 // ─── VOLUME ───────────────────────────────────────────────────────────────────
+// v2.31: GBPJPY added.
+// Fallback only — fires if lot_size absent from payload (should never occur
+// on v6.0.0+ Pine Scripts). Values in cTrader units (lots × LOT_SIZE).
+// GBPJPY: 1 standard FX lot = 100,000 units. 0.01/0.02/0.04 lots =
+// 1,000/2,000/4,000 units. *** EMPIRICALLY UNVERIFIED — confirm on first
+// paper trade that cTrader shows 0.01 lots, not some other size. ***
 
 function getVolume(score, ticker) {
   const s = parseInt(score);
@@ -136,6 +142,7 @@ function getVolume(score, ticker) {
     case 'GER40':     return s >= 9 ? 150 : s >= 8 ? 100 : 50;
     case 'AUS200':    return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     case 'SPOTBRENT': return s >= 9 ? 200 : s >= 8 ? 150 : 100;
+    case 'GBPJPY':    return s >= 9 ? 4000 : s >= 8 ? 2000 : 1000;  // v2.31
     default:
       console.warn('[VOLUME] No rule for', ticker, '— defaulting to 1');
       return 1;
@@ -144,7 +151,7 @@ function getVolume(score, ticker) {
 
 // Minimum volumes enforced by cTrader (units, not lots).
 // NAS100/GER40/AUS200: minVolume=10, stepVolume=10 (= 0.1 lots minimum).
-// All others meet minimum at 0.01 lots.
+// GBPJPY: standard FX minVolume = 1,000 (= 0.01 lots). No clamping needed.
 const MIN_VOLUME = {
   'NAS100': 10,
   'GER40':  10,
@@ -155,6 +162,9 @@ function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
+      // v2.31: GBPJPY added. LOT_SIZE = 100,000 (standard FX lot).
+      // 0.01 lots × 100,000 = 1,000 units.
+      // *** EMPIRICALLY UNVERIFIED — confirm on first paper trade. ***
       const LOT_SIZE = {
         'XAUUSD':    10000,
         'XAGUSD':    500000,
@@ -164,6 +174,7 @@ function resolveVolume(signal) {
         'GER40':     100,
         'AUS200':    100,
         'BTCUSD':    100,
+        'GBPJPY':    100000,   // v2.31 — standard FX lot; verify empirically
       };
       let lotSize = LOT_SIZE[signal.ticker] || 10000;
       let units   = Math.round(lots * lotSize);
@@ -184,8 +195,6 @@ function resolveVolume(signal) {
 }
 
 // ─── STOP LOSS CALCULATION ────────────────────────────────────────────────────
-// Primary: use stop_distance from payload (Kijun-based structural stop).
-// Fallback: atr × 2 (legacy — fires only if stop_distance absent).
 
 function resolveStopLoss(signal) {
   var ticker     = signal.ticker;
@@ -310,7 +319,6 @@ async function logHealth(status, tokenDaysLeft) {
 async function logAlert(alertType, severity, message) {
   console.log('ALERT [' + severity + '] ' + alertType + ': ' + message);
   try {
-    // 3A — field name corrected: code → alert_type
     await supabase.from('alerts').insert({
       alert_type: alertType,
       severity,
@@ -397,8 +405,6 @@ async function querySymbolSchedules() {
 }
 
 // ─── DEAL LIST DIAGNOSTIC ─────────────────────────────────────────────────────
-// Queries cTrader for deals in the last 30 seconds filtered by symbolId.
-// symbolId filter prevents false positives from other instruments' recent deals.
 
 async function queryRecentDeals(ctSymbol, dbId, symbolId) {
   try {
@@ -530,11 +536,6 @@ function attachExecutionEventListener() {
 }
 
 // ─── STARTUP: CLOSE ALL OPEN POSITIONS ───────────────────────────────────────
-// On every engine startup, any positions left open from a prior session are
-// closed unconditionally. This prevents orphaned positions from running
-// unmonitored after a pipeline restart, crash, or redeployment.
-// Log: one signal_log record per position (action: STARTUP_CLOSE).
-// Alert: STARTUP_POSITIONS_CLOSED | WARN if closures made, INFO if none.
 
 async function closeAllOpenPositions() {
   console.log('[STARTUP] Checking for open positions to close...');
@@ -636,10 +637,6 @@ async function closeAllOpenPositions() {
 }
 
 // ─── WATCHDOG ────────────────────────────────────────────────────────────────
-// Sends a lightweight ProtoOAReconcileReq every 10 minutes to verify the
-// cTrader connection is genuinely functional, not just superficially alive.
-// The health endpoint reports isConnected=true even when the TCP connection
-// has silently degraded — this catches that case and forces a reconnect.
 
 async function runWatchdog() {
   if (!isConnected || reconnecting) return;
@@ -685,8 +682,6 @@ let isConnected  = false;
 let reconnecting = false;
 let symbolIdMap      = {};
 let symbolIdToTicker = {};
-
-// ─── WATCHDOG STATE ───────────────────────────────────────────────────────────
 
 let lastWatchdogOk   = null;
 let watchdogFailures = 0;
@@ -754,22 +749,19 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.30 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.31 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
-    // Close any positions left open from prior session
     await closeAllOpenPositions();
 
-    // Start watchdog: verify connection every 10 minutes
     setInterval(runWatchdog, 10 * 60 * 1000);
 
     querySymbolSchedules().catch(function(e) {
       console.error('Symbol schedule query error:', e.message);
     });
 
-    // 3C — STARTUP_COMPLETE timing log
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.30 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.31 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -897,7 +889,6 @@ async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt)
 async function executeSignal(signal) {
   var latencyMs = getLatencyMs(signal);
 
-  // 3D — Pipeline latency threshold alerting
   if (latencyMs !== null && latencyMs > 3000) {
     await logAlert('LATENCY_CRITICAL', 'CRITICAL',
       'Signal latency ' + latencyMs + 'ms exceeds 3000ms threshold.'
@@ -1024,10 +1015,7 @@ async function executeSignal(signal) {
         return;
       }
 
-      // Reconcile fallback at 2000ms
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
-
-      // Deal list diagnostic at 4000ms
       setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId); }, 4000);
 
     } else if (isExit) {
@@ -1107,7 +1095,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.28',
+      version:          '2.31',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
@@ -1123,7 +1111,6 @@ function startHttpServer() {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // 3C — capture engine start time for STARTUP_COMPLETE timing
   global.engineStartMs = Date.now();
 
   await refreshAccessToken();
