@@ -18,7 +18,8 @@ const IS_PAPER        = process.env.IS_PAPER === 'true';
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PORT            = parseInt(process.env.PORT) || 3000;
 const HOST            = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
-const NTFY_URL        = process.env.NTFY_URL || null;
+const NTFY_CRITICAL_URL = process.env.NTFY_CRITICAL_URL || null;
+const NTFY_OPS_URL      = process.env.NTFY_OPS_URL      || null;
 
 console.log('IS_PAPER:', IS_PAPER, '| HOST:', HOST, '| ACCOUNT_ID:', ACCOUNT_ID);
 
@@ -59,13 +60,13 @@ async function refreshAccessToken() {
 
 // ─── NTFY ─────────────────────────────────────────────────────────────────────
 
-async function sendNtfy(title, message) {
-  if (!NTFY_URL) {
-    console.warn('[NTFY] NTFY_URL not set — notification skipped:', title);
+async function sendNtfy(title, message, url) {
+  if (!url) {
+    console.warn('[NTFY] URL not set — notification skipped:', title);
     return;
   }
   try {
-    await fetch(NTFY_URL, {
+    await fetch(url, {
       method:  'POST',
       headers: { 'Title': title, 'Content-Type': 'text/plain' },
       body:    message,
@@ -525,7 +526,8 @@ function attachExecutionEventListener() {
               '🔴 STOP LOSS — ' + ticker,
               'Position ' + slPositionId + ' stopped out at ' + executionPrice
               + '\nScore: ' + (slRow.score || '?')
-              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE')
+              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'),
+              NTFY_CRITICAL_URL
             );
           } else {
             console.warn('[SL FILL] No matching signal_log for positionId:', slPositionId);
@@ -536,7 +538,8 @@ function attachExecutionEventListener() {
               '🔴 STOP LOSS — ' + ticker,
               'Position ' + slPositionId + ' stopped out at ' + executionPrice
               + '\n(no signal_log match)'
-              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE')
+              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'),
+              NTFY_CRITICAL_URL
             );
           }
         } catch (slErr) {
