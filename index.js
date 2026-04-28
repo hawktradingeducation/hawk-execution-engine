@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.32 STARTING ===');
+console.log('=== HAWK ENGINE v2.33 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -18,6 +18,7 @@ const IS_PAPER        = process.env.IS_PAPER === 'true';
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PORT            = parseInt(process.env.PORT) || 3000;
 const HOST            = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
+const NTFY_URL        = process.env.NTFY_URL || null;
 
 console.log('IS_PAPER:', IS_PAPER, '| HOST:', HOST, '| ACCOUNT_ID:', ACCOUNT_ID);
 
@@ -56,10 +57,26 @@ async function refreshAccessToken() {
   return currentAccessToken;
 }
 
+// ─── NTFY ─────────────────────────────────────────────────────────────────────
+
+async function sendNtfy(title, message) {
+  if (!NTFY_URL) {
+    console.warn('[NTFY] NTFY_URL not set — notification skipped:', title);
+    return;
+  }
+  try {
+    await fetch(NTFY_URL, {
+      method:  'POST',
+      headers: { 'Title': title, 'Content-Type': 'text/plain' },
+      body:    message,
+    });
+    console.log('[NTFY] Sent:', title);
+  } catch (e) {
+    console.error('[NTFY] Failed:', e.message);
+  }
+}
+
 // ─── SYMBOL MAP ───────────────────────────────────────────────────────────────
-// v2.31: GBPJPY added.
-// NOTE: cTrader symbol string 'GBPJPY' assumed — verify in Pepperstone
-// cTrader symbol list on first deployment. If not found, check for 'GBP/JPY'.
 
 const SYMBOL_MAP = {
   'XAUUSD':    'XAUUSD',
@@ -70,17 +87,10 @@ const SYMBOL_MAP = {
   'GER40':     'GER40',
   'AUS200':    'AUS200',
   'SPOTBRENT': 'SpotBrent',
-  'GBPJPY':    'GBPJPY',       // v2.31 — verify exact cTrader symbol string
+  'GBPJPY':    'GBPJPY',
 };
 
-// --- STOP DISTANCE POINT MULTIPLIERS -----------------------------------------
-// Converts stop_distance (price units from Pine Script payload) into
-// cTrader relativeStopLoss integer.
-// Formula: relativeStopLoss = stop_distance x multiplier
-//
-// Empirically confirmed: 1 cTrader relativeStopLoss unit = 1e-05 price units
-// for all instruments regardless of decimal places.
-// Therefore: multiplier = 1 / 1e-05 = 100,000 universally.
+// ─── STOP DISTANCE POINT MULTIPLIERS ─────────────────────────────────────────
 
 const STOP_POINT_MULTIPLIER = {
   'XAUUSD':    100000,
@@ -91,7 +101,7 @@ const STOP_POINT_MULTIPLIER = {
   'GER40':     100000,
   'AUS200':    100000,
   'SPOTBRENT': 100000,
-  'GBPJPY':    100000,         // v2.31
+  'GBPJPY':    100000,
 };
 
 // ─── PENDING ORDER REGISTRY ───────────────────────────────────────────────────
@@ -124,12 +134,6 @@ setInterval(function() {
 }, 30000);
 
 // ─── VOLUME ───────────────────────────────────────────────────────────────────
-// v2.31: GBPJPY added.
-// Fallback only — fires if lot_size absent from payload (should never occur
-// on v6.0.0+ Pine Scripts). Values in cTrader units (lots × LOT_SIZE).
-// GBPJPY: 1 standard FX lot = 100,000 units. 0.01/0.02/0.04 lots =
-// 1,000/2,000/4,000 units. *** EMPIRICALLY UNVERIFIED — confirm on first
-// paper trade that cTrader shows 0.01 lots, not some other size. ***
 
 function getVolume(score, ticker) {
   const s = parseInt(score);
@@ -142,16 +146,13 @@ function getVolume(score, ticker) {
     case 'GER40':     return s >= 9 ? 150 : s >= 8 ? 100 : 50;
     case 'AUS200':    return s >= 9 ? 200 : s >= 8 ? 150 : 100;
     case 'SPOTBRENT': return s >= 9 ? 200 : s >= 8 ? 150 : 100;
-    case 'GBPJPY':    return s >= 9 ? 400000 : s >= 8 ? 200000 : 100000;  // v2.32 — 0.04/0.02/0.01 lots
+    case 'GBPJPY':    return s >= 9 ? 400000 : s >= 8 ? 200000 : 100000;
     default:
       console.warn('[VOLUME] No rule for', ticker, '— defaulting to 1');
       return 1;
   }
 }
 
-// Minimum volumes enforced by cTrader (units, not lots).
-// NAS100/GER40/AUS200: minVolume=10, stepVolume=10 (= 0.1 lots minimum).
-// GBPJPY: standard FX minVolume = 1,000 (= 0.01 lots). No clamping needed.
 const MIN_VOLUME = {
   'NAS100': 10,
   'GER40':  10,
@@ -162,12 +163,6 @@ function resolveVolume(signal) {
   if (signal.lot_size !== undefined && signal.lot_size !== null && signal.lot_size !== '') {
     const lots = parseFloat(signal.lot_size);
     if (!isNaN(lots) && lots > 0) {
-      // LOT_SIZE empirical values — units per lot in cTrader Open API.
-      // GBPJPY: empirically confirmed 23 Apr 2026.
-      //   lot_size=1.00 × 100,000 = 100,000 units → 0.01 lots in cTrader.
-      //   Therefore 0.01 lots = 100,000 units → 1 lot = 10,000,000 units.
-      //   LOT_SIZE = 10,000,000 ensures Pine payload 0.01/0.02/0.04 →
-      //   0.01/0.02/0.04 lots displayed in cTrader.
       const LOT_SIZE = {
         'XAUUSD':    10000,
         'XAGUSD':    500000,
@@ -177,7 +172,7 @@ function resolveVolume(signal) {
         'GER40':     100,
         'AUS200':    100,
         'BTCUSD':    100,
-        'GBPJPY':    10000000,  // v2.32 — empirically confirmed
+        'GBPJPY':    10000000,
       };
       let lotSize = LOT_SIZE[signal.ticker] || 10000;
       let units   = Math.round(lots * lotSize);
@@ -462,44 +457,105 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId) {
 }
 
 // ─── EXECUTION EVENT LISTENER ─────────────────────────────────────────────────
+// v2.33: Reads from event.descriptor (confirmed field path via diagnostic).
+// Pending order resolution restricted to ORDER_FILLED + MARKET + non-closing.
+// SL fill detection: ORDER_FILLED + STOP_LOSS_TAKE_PROFIT + isServerEvent.
+// ntfy push on SL fill.
 
 function attachExecutionEventListener() {
-connection.on('ProtoOAExecutionEvent', async function(event) {
+  connection.on('ProtoOAExecutionEvent', async function(event) {
     try {
-      var raw = typeof event.toObject === 'function' ? event.toObject() :
-                typeof event.toJSON   === 'function' ? event.toJSON()   :
-                Object.assign({}, event);
-console.log('[EXEC TYPE]', event.type);
-      console.log('[EXEC DESC]', JSON.stringify(
-        typeof event.descriptor.toObject === 'function' ? event.descriptor.toObject() :
-        typeof event.descriptor.toJSON   === 'function' ? event.descriptor.toJSON()   :
-        event.descriptor
-      ));
-    } catch(e) { console.log('[EXEC RAW ERROR]', e.message); }
-    try {
-      var execType       = event.executionType                         || null;
-      var order          = event.order                                 || {};
-      var tradeData      = order.tradeData                             || {};
-      var symbolId       = tradeData.symbolId                          || null;
-      var tradeSide      = tradeData.tradeSide                         || null;
-      var orderId        = order.orderId                               || null;
-      var positionId     = order.positionId                            || null;
-      var executionPrice = order.executionPrice !== undefined
-        ? order.executionPrice / 100000 : null;
-      var executedVolume = tradeData.volume                            || null;
-      var errorCode      = event.errorCode                             || null;
-      var ticker         = symbolId ? (symbolIdToTicker[String(symbolId)] || String(symbolId)) : 'UNKNOWN';
+      var desc           = event.descriptor;
+      var execType       = desc.executionType                                      || null;
+      var order          = desc.order                                              || {};
+      var tradeData      = order.tradeData                                         || {};
+      var symbolId       = tradeData.symbolId                                      || null;
+      var tradeSide      = tradeData.tradeSide                                     || null;
+      var orderId        = order.orderId                                           || null;
+      var orderType      = order.orderType                                         || null;
+      var closingOrder   = order.closingOrder === true;
+      var positionId     = (desc.position && desc.position.positionId)            || null;
+      var deal           = desc.deal                                               || null;
+      var executionPrice = deal && deal.executionPrice  ? deal.executionPrice      :
+                           order.executionPrice         ? order.executionPrice     : null;
+      var executedVolume = tradeData.volume                                        || null;
+      var errorCode      = desc.errorCode                                          || null;
+      var isServer       = desc.isServerEvent === true;
+      var ticker         = symbolId
+        ? (symbolIdToTicker[String(symbolId)] || String(symbolId))
+        : 'UNKNOWN';
 
       console.log('[EXEC EVENT]', execType,
         '| ticker:', ticker, '| side:', tradeSide,
-        '| price:', executionPrice, '| errorCode:', errorCode || 'none');
+        '| price:', executionPrice, '| orderType:', orderType,
+        '| isServer:', isServer, '| errorCode:', errorCode || 'none');
 
-      var dbId = (tradeSide && symbolId) ? resolvePending(symbolId, tradeSide) : null;
+      // ── SL fill: server-triggered stop loss close ─────────────────────────
+      if (execType === 'ORDER_FILLED' && orderType === 'STOP_LOSS_TAKE_PROFIT' && isServer) {
+        var slPositionId = positionId ? String(positionId) : null;
+        console.log('[SL FILL DETECTED] ticker:', ticker,
+          '| positionId:', slPositionId, '| fillPrice:', executionPrice);
+
+        await logExecutionEvent(
+          execType, symbolId, tradeSide, executionPrice,
+          executedVolume, orderId, positionId, errorCode,
+          desc, null
+        );
+
+        try {
+          var { data: slRow } = await supabase
+            .from('signal_log')
+            .select('id, score, lot_size')
+            .eq('position_id', slPositionId)
+            .eq('status', 'EXECUTED')
+            .single();
+
+          if (slRow) {
+            await supabase.from('signal_log').update({
+              status:     'STOPPED',
+              fill_price: executionPrice,
+            }).eq('id', slRow.id);
+
+            await logAlert('SL_FILL', 'WARN',
+              ticker + ' SL fill | positionId:' + slPositionId
+              + ' | fillPrice:' + executionPrice
+              + ' | dbId:' + slRow.id);
+
+            await sendNtfy(
+              '🔴 STOP LOSS — ' + ticker,
+              'Position ' + slPositionId + ' stopped out at ' + executionPrice
+              + '\nScore: ' + (slRow.score || '?')
+              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE')
+            );
+          } else {
+            console.warn('[SL FILL] No matching signal_log for positionId:', slPositionId);
+            await logAlert('SL_FILL_UNMATCHED', 'WARN',
+              ticker + ' SL fill — no signal_log match. positionId:' + slPositionId
+              + ' fillPrice:' + executionPrice);
+            await sendNtfy(
+              '🔴 STOP LOSS — ' + ticker,
+              'Position ' + slPositionId + ' stopped out at ' + executionPrice
+              + '\n(no signal_log match)'
+              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE')
+            );
+          }
+        } catch (slErr) {
+          console.error('[SL FILL] Lookup error:', slErr.message);
+        }
+        return;
+      }
+
+      // ── Resolve pending only on MARKET ORDER_FILLED (entry fill) ──────────
+      var dbId = null;
+      if (execType === 'ORDER_FILLED' && orderType === 'MARKET' && !closingOrder
+          && symbolId && tradeSide) {
+        dbId = resolvePending(symbolId, tradeSide);
+      }
 
       await logExecutionEvent(
         execType, symbolId, tradeSide, executionPrice,
         executedVolume, orderId, positionId, errorCode,
-        event, dbId
+        desc, dbId
       );
 
       if (!dbId) {
@@ -508,7 +564,7 @@ console.log('[EXEC TYPE]', event.type);
         return;
       }
 
-      if (execType === 'ORDER_FILLED' || execType === 'ORDER_PARTIALLY_FILLED') {
+      if (execType === 'ORDER_FILLED') {
         console.log('[EXEC EVENT] FILLED | dbId:' + dbId
           + ' | positionId:' + positionId + ' | fillPrice:' + executionPrice);
         await supabase.from('signal_log').update({
@@ -763,7 +819,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.32 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.33 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     await closeAllOpenPositions();
 
@@ -775,7 +831,7 @@ async function connectToCTrader() {
 
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.32 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.33 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1109,7 +1165,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.32',
+      version:          '2.33',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
