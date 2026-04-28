@@ -469,7 +469,8 @@ connection.on('ProtoOAExecutionEvent', async function(event) {
       var raw = typeof event.toObject === 'function' ? event.toObject() :
                 typeof event.toJSON   === 'function' ? event.toJSON()   :
                 Object.assign({}, event);
-      console.log('[EXEC RAW]', JSON.stringify(raw));
+console.log('[EXEC RAW]', JSON.stringify(raw));
+      console.log('[EXEC PROTO]', Object.getOwnPropertyNames(Object.getPrototypeOf(event)));
     } catch(e) { console.log('[EXEC RAW ERROR]', e.message); }
     try {
       var execType       = event.executionType                         || null;
