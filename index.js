@@ -464,7 +464,8 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId) {
 // ─── EXECUTION EVENT LISTENER ─────────────────────────────────────────────────
 
 function attachExecutionEventListener() {
-  connection.on('ProtoOAExecutionEvent', async function(event) {
+connection.on('ProtoOAExecutionEvent', async function(event) {
+    console.log('[EXEC RAW]', JSON.stringify(event, Object.getOwnPropertyNames(event)));
     try {
       var execType       = event.executionType                         || null;
       var order          = event.order                                 || {};
