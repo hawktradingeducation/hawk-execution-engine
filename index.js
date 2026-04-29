@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.37 STARTING ===');
+console.log('=== HAWK ENGINE v2.37.1 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -485,8 +485,11 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId, signal) {
       }
 
       // spread_at_entry: |executionPrice - marginRate| (marginRate ≈ mid price)
+      // Guard: for FX crosses, cTrader returns marginRate as a currency conversion
+      // rate (e.g. 1.35107 for GBPJPY), not the instrument price. If marginRate < 10
+      // it is a conversion rate — spread cannot be derived and we write null.
       var spreadAtEntry = null;
-      if (fillPrice != null && marginRate != null) {
+      if (fillPrice != null && marginRate != null && marginRate >= 10) {
         spreadAtEntry = parseFloat(Math.abs(fillPrice - marginRate).toFixed(5));
       }
 
@@ -870,7 +873,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.37 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.37.1 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     await closeAllOpenPositions();
 
@@ -882,7 +885,7 @@ async function connectToCTrader() {
 
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.37 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.37.1 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1217,7 +1220,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.37',
+      version:          '2.37.1',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
