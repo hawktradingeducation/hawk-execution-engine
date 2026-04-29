@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.36 STARTING ===');
+console.log('=== HAWK ENGINE v2.37 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -254,6 +254,7 @@ function isDuplicate(signalId) {
 async function logSignal(signal, result, status, errorMsg, latencyMs) {
   try {
     const { data, error } = await supabase.from('signal_log').insert({
+      // ── Core fields (original) ────────────────────────────────────────────
       signal_id:     signal.signal_id,
       strategy_id:   signal.strategy_id,
       ticker:        signal.ticker,
@@ -268,6 +269,37 @@ async function logSignal(signal, result, status, errorMsg, latencyMs) {
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER,
       latency_ms:    latencyMs || null,
+      // ── Enrichment fields — present on LONG/SHORT only, null on exits ─────
+      atr_36:             signal.atr_36             != null ? parseFloat(signal.atr_36)             : null,
+      rvol:               signal.rvol               != null ? parseFloat(signal.rvol)               : null,
+      kijun_slope_pct:    signal.kijun_slope_pct    != null ? parseFloat(signal.kijun_slope_pct)    : null,
+      ha_body_atr:        signal.ha_body_atr        != null ? parseFloat(signal.ha_body_atr)        : null,
+      cloud_clearance_atr:signal.cloud_clearance_atr!= null ? parseFloat(signal.cloud_clearance_atr): null,
+      tk_spread_atr:      signal.tk_spread_atr      != null ? parseFloat(signal.tk_spread_atr)      : null,
+      tenkan_slope_atr:   signal.tenkan_slope_atr   != null ? parseFloat(signal.tenkan_slope_atr)   : null,
+      session:            signal.session             || null,
+      // Pine outputs true/false as strings from str.tostring() — parse explicitly
+      was_resurrection:   signal.was_resurrection != null
+                            ? String(signal.was_resurrection) === 'true'
+                            : null,
+      ema_mod:            signal.ema_mod            != null ? parseInt(signal.ema_mod)              : null,
+      slowk_mod:          signal.slowk_mod          != null ? parseInt(signal.slowk_mod)            : null,
+      fwd_cloud:          signal.fwd_cloud          != null ? parseInt(signal.fwd_cloud)            : null,
+      chikou_vs_hist:     signal.chikou_vs_hist     != null ? parseInt(signal.chikou_vs_hist)       : null,
+      d1:                 signal.d1                 != null ? parseInt(signal.d1)                   : null,
+      d2:                 signal.d2                 != null ? parseInt(signal.d2)                   : null,
+      d3_raw:             signal.d3_raw             != null ? parseFloat(signal.d3_raw)             : null,
+      d4:                 signal.d4                 != null ? parseInt(signal.d4)                   : null,
+      d5:                 signal.d5                 != null ? parseInt(signal.d5)                   : null,
+      d5_inv:             signal.d5_inv             != null ? parseInt(signal.d5_inv)               : null,
+      d6:                 signal.d6                 != null ? parseInt(signal.d6)                   : null,
+      d7:                 signal.d7                 != null ? parseInt(signal.d7)                   : null,
+      wsf_active:         signal.wsf_active         != null ? parseInt(signal.wsf_active)           : null,
+      atr_ratio:          signal.atr_ratio          != null ? parseFloat(signal.atr_ratio)          : null,
+      cloud_thickness_atr:signal.cloud_thickness_atr!= null ? parseFloat(signal.cloud_thickness_atr): null,
+      bars_since_flat:    signal.bars_since_flat    != null ? parseInt(signal.bars_since_flat)      : null,
+      trend_aligned:      signal.trend_aligned      != null ? parseInt(signal.trend_aligned)        : null,
+      ghost_bars_active:  signal.ghost_bars_active  != null ? parseInt(signal.ghost_bars_active)    : null,
     }).select('id').single();
     if (error) throw error;
     console.log('Logged:', status, latencyMs ? '(' + latencyMs + 'ms)' : '', '| dbId:', data && data.id);
@@ -405,7 +437,7 @@ async function querySymbolSchedules() {
 
 // ─── DEAL LIST DIAGNOSTIC ─────────────────────────────────────────────────────
 
-async function queryRecentDeals(ctSymbol, dbId, symbolId) {
+async function queryRecentDeals(ctSymbol, dbId, symbolId, signal) {
   try {
     var toTs   = Date.now();
     var fromTs = toTs - 30000;
@@ -433,16 +465,46 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId) {
         + ' — check stop loss distance and minimum stop requirements.');
     } else {
       console.log('[DEAL LIST] Deals found after order:', JSON.stringify(deals));
-      var deal = deals[0];
+      var deal      = deals[0];
       var fillPrice = deal.executionPrice ? deal.executionPrice : null;
+
+      // Compute fill-time cost fields
+      var tvClose      = signal && signal.close ? parseFloat(signal.close) : null;
+      var marginRate   = deal.marginRate        ? parseFloat(deal.marginRate) : null;
+      var commissionRaw= deal.commission        ? parseFloat(deal.commission) : 0;
+      var tradeSide    = deal.tradeSide; // 'BUY' | 'SELL'
+
+      // entry_slippage: signed, positive = unfavourable
+      // Long: paid more than TV price = unfavourable (+)
+      // Short: received less than TV price = unfavourable (+)
+      var entrySlippage = null;
+      if (fillPrice != null && tvClose != null) {
+        entrySlippage = tradeSide === 'BUY'
+          ? parseFloat((fillPrice - tvClose).toFixed(5))
+          : parseFloat((tvClose - fillPrice).toFixed(5));
+      }
+
+      // spread_at_entry: |executionPrice - marginRate| (marginRate ≈ mid price)
+      var spreadAtEntry = null;
+      if (fillPrice != null && marginRate != null) {
+        spreadAtEntry = parseFloat(Math.abs(fillPrice - marginRate).toFixed(5));
+      }
+
       console.log('[DEAL LIST] CONFIRMED EXECUTION | dealId:', deal.dealId,
         '| fillPrice:', fillPrice,
+        '| slippage:', entrySlippage,
+        '| spread:', spreadAtEntry,
+        '| commission:', commissionRaw,
         '| status:', deal.dealStatus,
         '| dbId:', dbId);
+
       await supabase.from('signal_log')
         .update({
-          status:       'EXECUTED',
-          fill_price:   fillPrice,
+          status:          'EXECUTED',
+          fill_price:      fillPrice,
+          entry_slippage:  entrySlippage,
+          spread_at_entry: spreadAtEntry,
+          commission_usd:  commissionRaw,
           api_response: JSON.stringify({
             dealId:         deal.dealId,
             executionPrice: fillPrice,
@@ -808,7 +870,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.36 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.37 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     await closeAllOpenPositions();
 
@@ -820,7 +882,7 @@ async function connectToCTrader() {
 
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.36 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.37 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1076,7 +1138,7 @@ async function executeSignal(signal) {
       }
 
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
-      setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId); }, 4000);
+      setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId, signal); }, 4000);
 
     } else if (isExit) {
       var posRes2  = await connection.sendCommand('ProtoOAReconcileReq', {
@@ -1155,7 +1217,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.36',
+      version:          '2.37',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
