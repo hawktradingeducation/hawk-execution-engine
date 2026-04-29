@@ -4,7 +4,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.35 STARTING ===');
+console.log('=== HAWK ENGINE v2.36 STARTING ===');
 
 const UPSTASH_URL     = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN   = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -522,25 +522,11 @@ function attachExecutionEventListener() {
               + ' | fillPrice:' + executionPrice
               + ' | dbId:' + slRow.id);
 
-            await sendNtfy(
-              'STOP LOSS -- ' + ticker,
-              'Position ' + slPositionId + ' stopped out at ' + executionPrice
-              + '\nScore: ' + (slRow.score || '?')
-              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'),
-              NTFY_CRITICAL_URL
-            );
           } else {
             console.warn('[SL FILL] No matching signal_log for positionId:', slPositionId);
             await logAlert('SL_FILL_UNMATCHED', 'WARN',
               ticker + ' SL fill — no signal_log match. positionId:' + slPositionId
               + ' fillPrice:' + executionPrice);
-            await sendNtfy(
-              'STOP LOSS -- ' + ticker,
-              'Position ' + slPositionId + ' stopped out at ' + executionPrice
-              + '\n(no signal_log match)'
-              + '\nMode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'),
-              NTFY_CRITICAL_URL
-            );
           }
         } catch (slErr) {
           console.error('[SL FILL] Lookup error:', slErr.message);
@@ -822,7 +808,7 @@ async function connectToCTrader() {
     reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
     await logAlert('ENGINE_READY', 'INFO',
-      'Engine v2.35 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.36 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
     await closeAllOpenPositions();
 
@@ -834,7 +820,7 @@ async function connectToCTrader() {
 
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.35 startup complete in ' + startupElapsedMs + 'ms. Mode: '
+      'Engine v2.36 startup complete in ' + startupElapsedMs + 'ms. Mode: '
       + (IS_PAPER ? 'PAPER' : 'LIVE'));
 
   } catch (err) {
@@ -1169,7 +1155,7 @@ function startHttpServer() {
       status:           isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:             IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:           uptimeSecs,
-      version:          '2.35',
+      version:          '2.36',
       pendingOrders:    Object.keys(pendingOrders).length,
       lastWatchdogOk:   lastWatchdogOk,
       watchdogAgeS:     watchdogAge,
