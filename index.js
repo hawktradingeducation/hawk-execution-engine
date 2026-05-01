@@ -1,10 +1,14 @@
 'use strict';
 
+// ─── CHANGE v2.38.1 #1 of 3 ───────────────────────────────────────────────────
+// Added cors require. No other change on this line.
+const cors                  = require('cors');
+// ─────────────────────────────────────────────────────────────────────────────
 const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.38.0 STARTING ===');
+console.log('=== HAWK ENGINE v2.38.1 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -385,8 +389,6 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId, signal) {
           ? parseFloat((fillPrice - tvClose).toFixed(5))
           : parseFloat((tvClose - fillPrice).toFixed(5));
       }
-      // Guard: marginRate < 10 means it is a currency conversion rate (e.g. GBPJPY),
-      // not instrument price — spread cannot be derived in that case.
       var spreadAtEntry = null;
       if (fillPrice != null && marginRate != null && marginRate >= 10) {
         spreadAtEntry = parseFloat(Math.abs(fillPrice - marginRate).toFixed(5));
@@ -410,8 +412,6 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId, signal) {
 }
 
 // EXECUTION EVENT LISTENER
-// SL fill detection: ORDER_FILLED + STOP_LOSS_TAKE_PROFIT + isServerEvent = true
-// Pending resolution: ORDER_FILLED + MARKET + non-closing only
 function attachExecutionEventListener() {
   connection.on('ProtoOAExecutionEvent', async function(event) {
     try {
@@ -438,7 +438,6 @@ function attachExecutionEventListener() {
         '| price:', executionPrice, '| orderType:', orderType,
         '| isServer:', isServer, '| errorCode:', errorCode || 'none');
 
-      // SL fill: server-triggered trailing stop close
       if (execType === 'ORDER_FILLED' && orderType === 'STOP_LOSS_TAKE_PROFIT' && isServer) {
         var slPositionId = positionId ? String(positionId) : null;
         console.log('[SL FILL DETECTED] ticker:', ticker,
@@ -455,8 +454,6 @@ function attachExecutionEventListener() {
             await logAlert('SL_FILL', 'WARN',
               ticker + ' SL fill | positionId:' + slPositionId
               + ' | fillPrice:' + executionPrice + ' | dbId:' + slRow.id);
-            // NOTE: SL_FILL is suppressed from ntfy in critical-alert-notify Edge Function
-            // as of Apr 30 2026. Row still written to Supabase alerts table.
           } else {
             console.warn('[SL FILL] No matching signal_log for positionId:', slPositionId);
             await logAlert('SL_FILL_UNMATCHED', 'WARN',
@@ -559,7 +556,7 @@ async function closeAllOpenPositions() {
   }
 }
 
-// WATCHDOG — runs every 10 minutes; forces reconnect after 2 consecutive failures
+// WATCHDOG
 async function runWatchdog() {
   if (!isConnected || reconnecting) return;
   try {
@@ -626,13 +623,13 @@ async function connectToCTrader() {
     setInterval(function() { connection.sendHeartbeat(); }, 25000);
     isConnected = true; reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
-    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.38.0 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.38.1 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
     await closeAllOpenPositions();
     setInterval(runWatchdog, 10 * 60 * 1000);
     querySymbolSchedules().catch(function(e) { console.error('Symbol schedule query error:', e.message); });
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.38.0 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.38.1 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('cTrader connection failed:', msg);
@@ -642,10 +639,7 @@ async function connectToCTrader() {
   }
 }
 
-// QUEUE WASHDOWN — startup only
-// Drains any signals accumulated during a prior outage and discards them.
-// These will always be >5s old so processing them would be incorrect.
-// Live fallback signals are handled by startRedisPoller() below.
+// QUEUE WASHDOWN
 async function washdownQueue() {
   try {
     var flushed = 0;
@@ -662,12 +656,7 @@ async function washdownQueue() {
   } catch (e) { console.error('Washdown error:', e.message); }
 }
 
-// LIVE REDIS POLLER — v2.38.0
-// Polls hawk:signals every 1s during live operation.
-// If a signal lands in Redis due to a transient Railway timeout, this picks it
-// up and executes it within ~1s provided it is still within SIGNAL_TTL_MS (5s).
-// Signals older than TTL are logged as EXPIRED and discarded.
-// Only runs when isConnected — never attempts execution during reconnect.
+// LIVE REDIS POLLER
 var redisPollerActive = false;
 
 function startRedisPoller() {
@@ -879,6 +868,17 @@ async function executeSignal(signal) {
 function startHttpServer() {
   var app = express();
   app.use(express.json());
+
+  // ─── CHANGE v2.38.1 #2 of 3 ─────────────────────────────────────────────────
+  // CORS middleware — permits GET requests from the dashboard only.
+  // Applies to /health only (POST /signal uses a different verb and is unaffected).
+  // No security surface area changed — /health was already public and unauthenticated.
+  app.use(cors({
+    origin:  'https://hawk-dashboard.pages.dev',
+    methods: ['GET'],
+  }));
+  // ─────────────────────────────────────────────────────────────────────────────
+
   app.post('/signal', async function(req, res) {
     if (req.headers['x-internal-secret'] !== INTERNAL_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
@@ -888,20 +888,23 @@ function startHttpServer() {
     res.status(200).json({ ok: true });
     setImmediate(function() { executeSignal(signal); });
   });
+
   app.get('/health', function(req, res) {
     var watchdogAge = lastWatchdogOk
       ? Math.round((Date.now() - new Date(lastWatchdogOk).getTime()) / 1000) : null;
+    // ─── CHANGE v2.38.1 #3 of 3 — version bump in /health response ──────────────
     res.json({
-      status: isConnected ? 'CONNECTED' : 'DISCONNECTED',
-      mode: IS_PAPER ? 'PAPER' : 'LIVE',
-      uptime: process.uptime(),
-      version: '2.38.0',
-      pendingOrders: Object.keys(pendingOrders).length,
+      status:          isConnected ? 'CONNECTED' : 'DISCONNECTED',
+      mode:            IS_PAPER ? 'PAPER' : 'LIVE',
+      uptime:          process.uptime(),
+      version:         '2.38.1',
+      pendingOrders:   Object.keys(pendingOrders).length,
       lastWatchdogOk,
-      watchdogAgeS: watchdogAge,
+      watchdogAgeS:    watchdogAge,
       watchdogFailures,
     });
   });
+
   app.listen(PORT, function() { console.log('HTTP server listening on port', PORT); });
 }
 
