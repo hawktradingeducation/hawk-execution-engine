@@ -8,7 +8,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.38.1 STARTING ===');
+console.log('=== HAWK ENGINE v2.38.2 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -288,6 +288,67 @@ async function logHealth(status, tokenDaysLeft) {
       logged_at:         new Date().toISOString(),
     });
   } catch (e) { console.error('Supabase health_log error:', e.message); }
+}
+
+// ACTIVE POSITIONS SYNC — C1 v2.38.2
+// Runs every 60s inside the health interval.
+// Upserts all open cTrader positions to active_positions, then deletes any
+// rows whose position_id is no longer returned by reconcile (i.e. closed).
+// If the reconcile call itself fails, the function returns without deleting
+// anything — safety-first: never clear the table on a failed read.
+async function syncActivePositions() {
+  if (!isConnected) return;
+  try {
+    var posRes    = await connection.sendCommand('ProtoOAReconcileReq',
+                     { ctidTraderAccountId: ACCOUNT_ID });
+    var positions = posRes.position || [];
+    var openIds   = positions.map(function(p) { return String(p.positionId); });
+
+    if (positions.length > 0) {
+      var rows = positions.map(function(p) {
+        var symbolId = p.tradeData && p.tradeData.symbolId
+                       ? String(p.tradeData.symbolId) : null;
+        var openMs   = p.tradeData && p.tradeData.openTime
+                       ? parseInt(p.tradeData.openTime) : null;
+        return {
+          position_id:    String(p.positionId),
+          ticker:         symbolId ? (symbolIdToTicker[symbolId] || symbolId) : 'UNKNOWN',
+          trade_side:     (p.tradeData && p.tradeData.tradeSide) || null,
+          volume:         (p.tradeData && p.tradeData.volume)    || null,
+          entry_price:    p.price       != null ? p.price       : null,
+          stop_loss:      p.stopLoss    != null ? p.stopLoss    : null,
+          take_profit:    p.takeProfit  != null ? p.takeProfit  : null,
+          swap:           p.swap        != null ? p.swap        : null,
+          open_time:      openMs        != null ? new Date(openMs).toISOString() : null,
+          unrealised_pnl: null, // not available from reconcile; requires spot subscription
+          is_paper:       IS_PAPER,
+          updated_at:     new Date().toISOString(),
+        };
+      });
+      var { error: upsertErr } = await supabase.from('active_positions')
+        .upsert(rows, { onConflict: 'position_id' });
+      if (upsertErr) throw new Error('Upsert failed: ' + upsertErr.message);
+    }
+
+    // Delete positions no longer open — only runs if reconcile succeeded
+    if (openIds.length > 0) {
+      await supabase.from('active_positions')
+        .delete()
+        .eq('is_paper', IS_PAPER)
+        .not('position_id', 'in', '(' + openIds.map(function(id) {
+          return '"' + id + '"';
+        }).join(',') + ')');
+    } else {
+      // Reconcile returned zero positions — clear all rows for this mode
+      await supabase.from('active_positions').delete().eq('is_paper', IS_PAPER);
+    }
+
+    console.log('[SYNC] active_positions | open:', positions.length,
+      openIds.length > 0 ? '(' + openIds.join(', ') + ')' : '(none)');
+  } catch (err) {
+    var msg = (err && err.message) ? err.message : String(err);
+    console.error('[SYNC] active_positions error — table not modified:', msg);
+  }
 }
 
 async function logAlert(alertType, severity, message) {
@@ -625,13 +686,13 @@ async function connectToCTrader() {
     setInterval(function() { connection.sendHeartbeat(); }, 25000);
     isConnected = true; reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
-    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.38.1 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.38.2 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
     await closeAllOpenPositions();
     setInterval(runWatchdog, 10 * 60 * 1000);
     querySymbolSchedules().catch(function(e) { console.error('Symbol schedule query error:', e.message); });
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.38.1 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.38.2 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('cTrader connection failed:', msg);
@@ -899,7 +960,7 @@ function startHttpServer() {
       status:          isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:            IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:          process.uptime(),
-      version:         '2.38.1',
+      version:         '2.38.2',
       pendingOrders:   Object.keys(pendingOrders).length,
       lastWatchdogOk,
       watchdogAgeS:    watchdogAge,
@@ -929,6 +990,7 @@ async function main() {
       await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
         'cTrader access token expires in ' + daysLeft + ' days. Immediate action required.');
     }
+    await syncActivePositions();
   }, 60000);
 }
 
