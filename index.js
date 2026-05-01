@@ -278,12 +278,14 @@ async function logExecutionEvent(execType, symbolId, tradeSide, executionPrice,
 }
 
 async function logHealth(status, tokenDaysLeft) {
+  // FIXED v2.38.1: corrected column names to match actual health_log schema.
+  // Previous: checked_at + token_days_left + is_paper — none of these columns exist.
+  // Actual columns are: logged_at, token_expiry_days.
   try {
     await supabase.from('health_log').insert({
       status,
-      token_days_left: tokenDaysLeft || null,
-      checked_at:      new Date().toISOString(),
-      is_paper:        IS_PAPER,
+      token_expiry_days: tokenDaysLeft || null,
+      logged_at:         new Date().toISOString(),
     });
   } catch (e) { console.error('Supabase health_log error:', e.message); }
 }
