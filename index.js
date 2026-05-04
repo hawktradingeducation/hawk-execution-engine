@@ -8,7 +8,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.38.2 STARTING ===');
+console.log('=== HAWK ENGINE v2.39.0 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -31,6 +31,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let currentAccessToken = null;
 let tokenExpiryTime    = null;
+
+// v2.39.0 state variables
+let lastAdvisoryDay         = null;  // date string — prevents >1 advisory per calendar day
+let lastCriticalSentAt      = null;  // ms timestamp — gates hourly critical token alerts
+const knownPositionIds      = new Set(); // position IDs seen since start — mismatch detection
+const expiredSignalTimestamps = [];  // recent EXPIRED timestamps — spike detection
 
 // TOKEN
 async function refreshAccessToken() {
@@ -345,6 +351,31 @@ async function syncActivePositions() {
 
     console.log('[SYNC] active_positions | open:', positions.length,
       openIds.length > 0 ? '(' + openIds.join(', ') + ')' : '(none)');
+
+    // v2.39.0: position state mismatch detection — fires once per new unknown position_id
+    for (var i = 0; i < openIds.length; i++) {
+      var pid = openIds[i];
+      if (!knownPositionIds.has(pid)) {
+        try {
+          var mPos     = positions.find(function(p) { return String(p.positionId) === pid; });
+          var mSymId   = mPos && mPos.tradeData ? String(mPos.tradeData.symbolId) : null;
+          var mTicker  = mSymId ? (symbolIdToTicker[mSymId] || 'UNKNOWN') : 'UNKNOWN';
+          var slCheck  = await supabase.from('signal_log')
+            .select('id').eq('position_id', pid).eq('is_paper', IS_PAPER).limit(1);
+          if (!slCheck.data || slCheck.data.length === 0) {
+            await logAlert('POSITION_STATE_MISMATCH', 'WARN',
+              'cTrader position ' + pid + ' (' + mTicker + ') has no engine signal_log record. ' +
+              'May have been opened outside the pipeline or engine restarted during a trade.');
+          }
+        } catch (mismatchErr) {
+          console.error('[SYNC] Mismatch check error:', mismatchErr.message);
+        }
+        knownPositionIds.add(pid);
+      }
+    }
+    for (var knownPid of Array.from(knownPositionIds)) {
+      if (!openIds.includes(knownPid)) knownPositionIds.delete(knownPid);
+    }
   } catch (err) {
     var msg = (err && err.message) ? err.message : String(err);
     console.error('[SYNC] active_positions error — table not modified:', msg);
@@ -834,7 +865,20 @@ async function executeSignal(signal) {
   }
   if (isExpired(signal)) {
     console.warn('Signal EXPIRED:', signal.signal_id, '| age:', latencyMs + 'ms');
-    await logSignal(signal, null, 'EXPIRED', 'Signal age exceeded 5000ms', latencyMs); return;
+    await logSignal(signal, null, 'EXPIRED', 'Signal age exceeded 5000ms', latencyMs);
+    // v2.39.0: expired signal spike detection
+    var expNow = Date.now();
+    expiredSignalTimestamps.push(expNow);
+    while (expiredSignalTimestamps.length > 0 && expiredSignalTimestamps[0] < expNow - 300000) {
+      expiredSignalTimestamps.shift();
+    }
+    if (expiredSignalTimestamps.length > 3) {
+      var spkCount = expiredSignalTimestamps.length;
+      expiredSignalTimestamps.length = 0;
+      await logAlert('EXPIRED_SIGNALS_SPIKE', 'WARN',
+        spkCount + ' signals expired in 5 minutes. Railway latency elevated or engine under load.');
+    }
+    return;
   }
   if (isDuplicate(signal.signal_id)) { console.log('Duplicate signal ignored:', signal.signal_id); return; }
   if (!isConnected) {
@@ -960,7 +1004,7 @@ function startHttpServer() {
       status:          isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:            IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:          process.uptime(),
-      version:         '2.38.2',
+      version:         '2.39.0',
       pendingOrders:   Object.keys(pendingOrders).length,
       lastWatchdogOk,
       watchdogAgeS:    watchdogAge,
@@ -986,9 +1030,24 @@ async function main() {
   setInterval(async function() {
     var daysLeft = tokenExpiryTime ? Math.floor((tokenExpiryTime - Date.now()) / 86400000) : null;
     await logHealth(isConnected ? 'RUNNING' : 'DISCONNECTED', daysLeft);
-    if (daysLeft !== null && daysLeft < 2) {
-      await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
-        'cTrader access token expires in ' + daysLeft + ' days. Immediate action required.');
+    if (daysLeft !== null) {
+      // v2.39.0: graduated token expiry alerts
+      if (daysLeft <= 5) {
+        var today = new Date().toDateString();
+        if (lastAdvisoryDay !== today) {
+          lastAdvisoryDay = today;
+          await logAlert('TOKEN_EXPIRY_ADVISORY', 'WARN',
+            'cTrader token expires in ' + daysLeft + ' day(s). Refresh via Spotware API playground.');
+        }
+      }
+      if (daysLeft <= 1) {
+        var now = Date.now();
+        if (!lastCriticalSentAt || (now - lastCriticalSentAt) > 3600000) {
+          lastCriticalSentAt = now;
+          await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
+            'URGENT: cTrader token expires in ' + daysLeft + ' day(s). Engine stops executing on expiry. Refresh NOW.');
+        }
+      }
     }
     await syncActivePositions();
   }, 60000);
