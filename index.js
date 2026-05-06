@@ -8,7 +8,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.39.0 STARTING ===');
+console.log('=== HAWK ENGINE v2.40.0 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -22,8 +22,9 @@ const IS_PAPER          = process.env.IS_PAPER === 'true';
 const INTERNAL_SECRET   = process.env.INTERNAL_SECRET;
 const PORT              = parseInt(process.env.PORT) || 3000;
 const HOST              = IS_PAPER ? 'demo.ctraderapi.com' : 'live.ctraderapi.com';
-const NTFY_CRITICAL_URL = process.env.NTFY_CRITICAL_URL || null; // DEAD CODE — never called
-const NTFY_OPS_URL      = process.env.NTFY_OPS_URL      || null; // DEAD CODE — never called
+// NOTE: NTFY_CRITICAL_URL and NTFY_OPS_URL removed in v2.40.0.
+// sendNtfy() was dead code — all push notifications route via Supabase Edge Function.
+// Remove both variables from Railway environment if still present.
 
 console.log('IS_PAPER:', IS_PAPER, '| HOST:', HOST, '| ACCOUNT_ID:', ACCOUNT_ID);
 
@@ -60,25 +61,12 @@ async function refreshAccessToken() {
   await logAlert('TOKEN_REFRESH_SUCCEEDED', 'INFO',
     'Access token refreshed successfully. Expires in ' + daysLeft + ' days.');
   await logHealth('RUNNING', daysLeft);
+  // v2.40.0: consolidated into TOKEN_EXPIRY_ADVISORY at 7-day threshold (replaces TOKEN_EXPIRY_WARNING)
   if (daysLeft < 7) {
-    await logAlert('TOKEN_EXPIRY_WARNING', 'WARN',
-      'cTrader access token expires in ' + daysLeft + ' days.');
+    await logAlert('TOKEN_EXPIRY_ADVISORY', 'WARN',
+      'cTrader access token expires in ' + daysLeft + ' day(s). Refresh required — see Railway token procedure.');
   }
   return currentAccessToken;
-}
-
-// NTFY — DEAD CODE: sendNtfy() is defined but never called anywhere in the engine.
-// All ntfy notifications are handled by the Supabase critical-alert-notify Edge Function.
-async function sendNtfy(title, message, url) {
-  if (!url) { console.warn('[NTFY] URL not set — notification skipped:', title); return; }
-  try {
-    await fetch(url, {
-      method:  'POST',
-      headers: { 'Title': title, 'Content-Type': 'text/plain' },
-      body:    message,
-    });
-    console.log('[NTFY] Sent:', title);
-  } catch (e) { console.error('[NTFY] Failed:', e.message); }
 }
 
 // SYMBOL MAP
@@ -443,7 +431,8 @@ async function querySymbolSchedules() {
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('Symbol schedule query failed:', msg);
-    await logAlert('SCHEDULE_QUERY_FAILED', 'WARN', msg);
+    await logAlert('SCHEDULE_QUERY_FAILED', 'WARN',
+      'Symbol schedule query failed — session data not updated. Engine continues operating but schedule display may be stale. Error: ' + msg);
   }
 }
 
@@ -468,8 +457,10 @@ async function queryRecentDeals(ctSymbol, dbId, symbolId, signal) {
         error_message: 'No deal recorded by cTrader within 30s — order rejected silently',
       }).eq('id', dbId);
       await logAlert('ORDER_SILENT_REJECT', 'WARN',
-        ctSymbol + ' order sent but no deal recorded by cTrader. dbId:' + dbId
-        + ' — check stop loss distance and minimum stop requirements.');
+        ctSymbol + ' order sent but no deal recorded by cTrader within 30s. dbId:' + dbId
+        + ' | action:' + (signal && signal.action ? signal.action : 'UNKNOWN')
+        + ' | atr:' + (signal && signal.atr ? signal.atr : 'UNKNOWN')
+        + '. Investigate via Supabase signal_log and cTrader deal history.');
     } else {
       var deal          = deals[0];
       var fillPrice     = deal.executionPrice ? deal.executionPrice : null;
@@ -690,7 +681,7 @@ async function connectToCTrader() {
     connection.on('close', function() {
       console.warn('cTrader connection closed — scheduling reconnect');
       isConnected = false; reconnecting = false;
-      logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader connection closed. Reconnecting...');
+      logAlert('WEBSOCKET_CLOSED', 'WARN', 'cTrader WebSocket connection closed unexpectedly. Reconnect scheduled automatically. If this persists, check Railway logs and cTrader API status.');
       setTimeout(connectToCTrader, 3000);
     });
     connection.on('error', function(err) {
@@ -838,7 +829,11 @@ async function reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt)
       setTimeout(function() { reconcileExitConfirm(dbId, positionId, symbolId, isLong, attempt + 1); }, 1000); return;
     }
     if (stillOpen) {
-      await logAlert('EXIT_UNCONFIRMED', 'WARN', 'Position still open after ' + attempt + ' checks. dbId:' + dbId); return;
+      var tickerLabel = symbolId ? (symbolIdToTicker[String(symbolId)] || String(symbolId)) : 'UNKNOWN';
+      await logAlert('EXIT_UNCONFIRMED', 'WARN',
+        'Position still open after ' + attempt + ' reconcile checks. ticker:' + tickerLabel
+        + ' | positionId:' + (positionId || 'UNKNOWN') + ' | dbId:' + dbId
+        + '. Manual check required.'); return;
     }
     await supabase.from('signal_log').update({
       status: 'CLOSED', position_id: positionId,
@@ -883,6 +878,10 @@ async function executeSignal(signal) {
   if (isDuplicate(signal.signal_id)) { console.log('Duplicate signal ignored:', signal.signal_id); return; }
   if (!isConnected) {
     console.warn('Engine not connected — signal dropped');
+    await logAlert('ENGINE_NOT_CONNECTED', 'CRITICAL',
+      'Signal received but engine not connected to cTrader — signal dropped. ticker:'
+      + (signal.ticker || 'UNKNOWN') + ' | action:' + (signal.action || 'UNKNOWN')
+      + ' | signal_id:' + (signal.signal_id || 'UNKNOWN') + '. Check Railway logs and cTrader connection.');
     await logSignal(signal, null, 'ERROR', 'Engine not connected', latencyMs); return;
   }
   var action  = signal.action;
@@ -1004,7 +1003,7 @@ function startHttpServer() {
       status:          isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:            IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:          process.uptime(),
-      version:         '2.39.0',
+      version:         '2.40.0',
       pendingOrders:   Object.keys(pendingOrders).length,
       lastWatchdogOk,
       watchdogAgeS:    watchdogAge,
@@ -1031,13 +1030,13 @@ async function main() {
     var daysLeft = tokenExpiryTime ? Math.floor((tokenExpiryTime - Date.now()) / 86400000) : null;
     await logHealth(isConnected ? 'RUNNING' : 'DISCONNECTED', daysLeft);
     if (daysLeft !== null) {
-      // v2.39.0: graduated token expiry alerts
-      if (daysLeft <= 5) {
+      // v2.40.0: graduated token expiry alerts — consolidated TOKEN_EXPIRY_WARNING into TOKEN_EXPIRY_ADVISORY
+      if (daysLeft <= 7) {
         var today = new Date().toDateString();
         if (lastAdvisoryDay !== today) {
           lastAdvisoryDay = today;
           await logAlert('TOKEN_EXPIRY_ADVISORY', 'WARN',
-            'cTrader token expires in ' + daysLeft + ' day(s). Refresh via Spotware API playground.');
+            'cTrader access token expires in ' + daysLeft + ' day(s). Refresh required — see Railway token procedure.');
         }
       }
       if (daysLeft <= 1) {
@@ -1045,7 +1044,7 @@ async function main() {
         if (!lastCriticalSentAt || (now - lastCriticalSentAt) > 3600000) {
           lastCriticalSentAt = now;
           await logAlert('TOKEN_EXPIRY_CRITICAL', 'CRITICAL',
-            'URGENT: cTrader token expires in ' + daysLeft + ' day(s). Engine stops executing on expiry. Refresh NOW.');
+            'URGENT: cTrader token expires in ' + daysLeft + ' day(s). Engine will stop executing on expiry. Refresh immediately via Railway token procedure.');
         }
       }
     }
