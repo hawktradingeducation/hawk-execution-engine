@@ -1,5 +1,35 @@
 'use strict';
 
+// ─── CHANGE LOG ───────────────────────────────────────────────────────────────
+// v2.41.0 — v7.1.5 PAYLOAD ALIGNMENT + FIXED BACKSTOP
+//
+// 1. logSignal() field mapping overhaul
+//    REMOVED: cloud_clearance_atr, ema_mod, slowk_mod,
+//             d1, d2, d3_raw, d4, d5, d5_inv, d6, d7, c_dims_passed
+//    ADDED:   entry_type, cloud_dist_atr, chandelier_mod, chandelier_dist_atr,
+//             real_bar_dir, d6_mod, tk_cross_bars_ago, mr_dims_passed,
+//             cd_gates_passed
+//    All new fields match the v7.1.5 Pine Script payload exactly.
+//
+// 2. ProtoOANewOrderReq: removed trailingStopLoss:true
+//    Backstop is now a fixed relativeStopLoss only (kijun ± N×ATR at entry).
+//    Normal exits handled by Chandelier + HA condition in Pine, not cTrader trail.
+//
+// 3. Order comment updated: includes entry_type (MR/C) alongside score.
+//    Format: HAWK|<strategy_id>|<entry_type><score>
+//
+// 4. BACKSTOP_HIT CRITICAL alert reinstated for LONG_STOP / SHORT_STOP actions.
+//    Was removed when trailing stop was firing constantly. Now safe to restore.
+//
+// 5. Version strings corrected throughout (ENGINE_READY and STARTUP_COMPLETE
+//    still said v2.38.2 — carried forward in error from earlier versions).
+//
+// Supabase schema changes required (run before deploying this engine):
+//    See Hawksphere clean start SQL in the strategy development session log.
+//    Execute archive → truncate → rename → drop → add columns in sequence.
+//    Do NOT deploy this engine against the v6 schema — logSignal() will fail.
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── CHANGE v2.38.1 #1 of 3 ───────────────────────────────────────────────────
 // Added cors require. No other change on this line.
 const cors                  = require('cors');
@@ -8,7 +38,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.40.0 STARTING ===');
+console.log('=== HAWK ENGINE v2.41.0 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -214,34 +244,46 @@ async function logSignal(signal, result, status, errorMsg, latencyMs) {
       processed_at:  new Date().toISOString(),
       is_paper:      IS_PAPER,
       latency_ms:    latencyMs || null,
+      // ── v7.1.5 PAYLOAD FIELDS ────────────────────────────────────────────────
+      // entry_type: MR or C (new in v7.1.0)
+      entry_type:          signal.entry_type             || null,
+      // Retained enrichment fields (unchanged from v7.0.0)
       atr_36:              signal.atr_36              != null ? parseFloat(signal.atr_36)              : null,
       rvol:                signal.rvol                != null ? parseFloat(signal.rvol)                : null,
-      kijun_slope_pct:     signal.kijun_slope_pct     != null ? parseFloat(signal.kijun_slope_pct)     : null,
-      ha_body_atr:         signal.ha_body_atr         != null ? parseFloat(signal.ha_body_atr)         : null,
-      cloud_clearance_atr: signal.cloud_clearance_atr != null ? parseFloat(signal.cloud_clearance_atr) : null,
-      tk_spread_atr:       signal.tk_spread_atr       != null ? parseFloat(signal.tk_spread_atr)       : null,
-      tenkan_slope_atr:    signal.tenkan_slope_atr    != null ? parseFloat(signal.tenkan_slope_atr)    : null,
+      kijun_slope_pct:     signal.kijun_slope_pct     != null ? parseFloat(signal.kijun_slope_pct)    : null,
+      ha_body_atr:         signal.ha_body_atr         != null ? parseFloat(signal.ha_body_atr)        : null,
+      cloud_dist_atr:      signal.cloud_dist_atr      != null ? parseFloat(signal.cloud_dist_atr)     : null,
+      tk_spread_atr:       signal.tk_spread_atr       != null ? parseFloat(signal.tk_spread_atr)      : null,
+      tenkan_slope_atr:    signal.tenkan_slope_atr    != null ? parseFloat(signal.tenkan_slope_atr)   : null,
       session:             signal.session              || null,
       was_resurrection:    signal.was_resurrection != null
                              ? String(signal.was_resurrection) === 'true' : null,
-      ema_mod:             signal.ema_mod             != null ? parseInt(signal.ema_mod)               : null,
-      slowk_mod:           signal.slowk_mod           != null ? parseInt(signal.slowk_mod)             : null,
-      fwd_cloud:           signal.fwd_cloud           != null ? parseInt(signal.fwd_cloud)             : null,
-      chikou_vs_hist:      signal.chikou_vs_hist      != null ? parseInt(signal.chikou_vs_hist)        : null,
-      d1:                  signal.d1                  != null ? parseInt(signal.d1)                    : null,
-      d2:                  signal.d2                  != null ? parseInt(signal.d2)                    : null,
-      d3_raw:              signal.d3_raw              != null ? parseFloat(signal.d3_raw)              : null,
-      d4:                  signal.d4                  != null ? parseInt(signal.d4)                    : null,
-      d5:                  signal.d5                  != null ? parseInt(signal.d5)                    : null,
-      d5_inv:              signal.d5_inv              != null ? parseInt(signal.d5_inv)                : null,
-      d6:                  signal.d6                  != null ? parseInt(signal.d6)                    : null,
-      d7:                  signal.d7                  != null ? parseInt(signal.d7)                    : null,
-      wsf_active:          signal.wsf_active          != null ? parseInt(signal.wsf_active)            : null,
-      atr_ratio:           signal.atr_ratio           != null ? parseFloat(signal.atr_ratio)           : null,
+      // Renamed from ema_mod (v7.1.1: exit mechanism changed to Chandelier)
+      chandelier_mod:      signal.chandelier_mod      != null ? parseInt(signal.chandelier_mod)       : null,
+      // New in v7.1.5: Chandelier buffer at entry in ATR units
+      chandelier_dist_atr: signal.chandelier_dist_atr != null ? parseFloat(signal.chandelier_dist_atr) : null,
+      // New in v7.1.5: real bar direction at entry confirmation (1=bullish, -1=bearish)
+      real_bar_dir:        signal.real_bar_dir        != null ? parseInt(signal.real_bar_dir)         : null,
+      // Renamed from slowk_mod (v7.1.0: Slow Kijun removed)
+      d6_mod:              signal.d6_mod              != null ? parseInt(signal.d6_mod)               : null,
+      fwd_cloud:           signal.fwd_cloud           != null ? parseInt(signal.fwd_cloud)            : null,
+      chikou_vs_hist:      signal.chikou_vs_hist      != null ? parseInt(signal.chikou_vs_hist)       : null,
+      // New in v7.1.0: MR architecture fields
+      tk_cross_bars_ago:   signal.tk_cross_bars_ago   != null ? parseInt(signal.tk_cross_bars_ago)    : null,
+      mr_dims_passed:      signal.mr_dims_passed      != null ? parseInt(signal.mr_dims_passed)       : null,
+      // Replaces c_dims_passed (now a meaningful count regardless of CD gate ON/OFF)
+      cd_gates_passed:     signal.cd_gates_passed     != null ? parseInt(signal.cd_gates_passed)      : null,
+      wsf_active:          signal.wsf_active          != null ? parseInt(signal.wsf_active)           : null,
+      atr_ratio:           signal.atr_ratio           != null ? parseFloat(signal.atr_ratio)          : null,
       cloud_thickness_atr: signal.cloud_thickness_atr != null ? parseFloat(signal.cloud_thickness_atr) : null,
-      bars_since_flat:     signal.bars_since_flat     != null ? parseInt(signal.bars_since_flat)       : null,
-      trend_aligned:       signal.trend_aligned       != null ? parseInt(signal.trend_aligned)         : null,
-      ghost_bars_active:   signal.ghost_bars_active   != null ? parseInt(signal.ghost_bars_active)     : null,
+      bars_since_flat:     signal.bars_since_flat     != null ? parseInt(signal.bars_since_flat)      : null,
+      trend_aligned:       signal.trend_aligned       != null ? parseInt(signal.trend_aligned)        : null,
+      ghost_bars_active:   signal.ghost_bars_active   != null ? parseInt(signal.ghost_bars_active)    : null,
+      // ── REMOVED from v6.0.3 (not in v7.1.5 payload) ─────────────────────────
+      // ema_mod, slowk_mod → replaced by chandelier_mod and d6_mod above
+      // d1, d2, d3_raw, d4, d5, d5_inv, d6, d7 → D-gate architecture retired
+      // cloud_clearance_atr → replaced by cloud_dist_atr above
+      // c_dims_passed → replaced by cd_gates_passed above
     }).select('id').single();
     if (error) throw error;
     console.log('Logged:', status, latencyMs ? '(' + latencyMs + 'ms)' : '', '| dbId:', data && data.id);
@@ -708,13 +750,13 @@ async function connectToCTrader() {
     setInterval(function() { connection.sendHeartbeat(); }, 25000);
     isConnected = true; reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
-    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.38.2 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.41.0 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
     await closeAllOpenPositions();
     setInterval(runWatchdog, 10 * 60 * 1000);
     querySymbolSchedules().catch(function(e) { console.error('Symbol schedule query error:', e.message); });
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.38.2 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.41.0 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('cTrader connection failed:', msg);
@@ -921,8 +963,9 @@ async function executeSignal(signal) {
           ctidTraderAccountId: ACCOUNT_ID, symbolId, orderType: 'MARKET',
           tradeSide, volume,
           relativeStopLoss: stopLoss,
-          trailingStopLoss: true,
-          comment: 'HAWK|' + signal.strategy_id + '|S' + signal.score,
+          // v2.41.0: trailingStopLoss removed. Backstop is fixed (kijun ± N×ATR at entry).
+          // cTrader holds a static stop level. Exits handled by Pine Chandelier + HA condition.
+          comment: 'HAWK|' + signal.strategy_id + '|' + (signal.entry_type || 'C') + (signal.score || '9'),
         });
         console.log('[ORDER] Sent to cTrader | ticker:', ctSymbol, '| side:', tradeSide,
           '| volume:', volume, '| stopLoss:', stopLoss, 'pts');
@@ -941,6 +984,16 @@ async function executeSignal(signal) {
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
       setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId, signal); }, 4000);
     } else if (isExit) {
+      // v2.41.0: fire CRITICAL alert on backstop hit actions (fixed stop, not trailing)
+      if (action === 'LONG_STOP' || action === 'SHORT_STOP') {
+        await logAlert('BACKSTOP_HIT', 'CRITICAL',
+          'Backstop stop loss hit | ticker: ' + (signal.ticker || 'UNKNOWN')
+          + ' | action: ' + action
+          + ' | entry_type: ' + (signal.entry_type || 'UNKNOWN')
+          + ' | close: ' + (signal.close || 'UNKNOWN')
+          + ' | atr: ' + (signal.atr || 'UNKNOWN')
+          + ' | signal_id: ' + (signal.signal_id || 'UNKNOWN'));
+      }
       var posRes2  = await connection.sendCommand('ProtoOAReconcileReq', { ctidTraderAccountId: ACCOUNT_ID });
       var position = (posRes2.position || []).find(function(p) {
         return String(p.tradeData && p.tradeData.symbolId) === String(symbolId)
@@ -1003,7 +1056,7 @@ function startHttpServer() {
       status:          isConnected ? 'CONNECTED' : 'DISCONNECTED',
       mode:            IS_PAPER ? 'PAPER' : 'LIVE',
       uptime:          process.uptime(),
-      version:         '2.40.0',
+      version:         '2.41.0',
       pendingOrders:   Object.keys(pendingOrders).length,
       lastWatchdogOk,
       watchdogAgeS:    watchdogAge,
