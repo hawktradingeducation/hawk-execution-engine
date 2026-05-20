@@ -1,33 +1,32 @@
 'use strict';
 
 // ─── CHANGE LOG ───────────────────────────────────────────────────────────────
-// v2.41.0 — v7.1.5 PAYLOAD ALIGNMENT + FIXED BACKSTOP
+// v2.42.0 — v8.3 PAYLOAD ALIGNMENT + R_REV ACTION HANDLING
 //
-// 1. logSignal() field mapping overhaul
-//    REMOVED: cloud_clearance_atr, ema_mod, slowk_mod,
-//             d1, d2, d3_raw, d4, d5, d5_inv, d6, d7, c_dims_passed
-//    ADDED:   entry_type, cloud_dist_atr, chandelier_mod, chandelier_dist_atr,
-//             real_bar_dir, d6_mod, tk_cross_bars_ago, mr_dims_passed,
-//             cd_gates_passed
-//    All new fields match the v7.1.5 Pine Script payload exactly.
+// 1. LONG_R_REV / SHORT_R_REV action handling added.
+//    R reversal of open C position. Closes existing position then opens new
+//    position in opposite direction. Both legs logged to signal_log separately.
+//    Previously fell through to [UNKNOWN ACTION] warn and was silently dropped.
 //
-// 2. ProtoOANewOrderReq: removed trailingStopLoss:true
-//    Backstop is now a fixed relativeStopLoss only (kijun ± N×ATR at entry).
-//    Normal exits handled by Chandelier + HA condition in Pine, not cTrader trail.
+// 2. logSignal() — 7 new v8.3 enrichment fields added:
+//    utc_hour, dow_utc, ar_char, kijun_dist_atr, stop_dist_atr,
+//    backstop_level, utc_hour_exit.
+//    All fields are nullable — engine operates normally if Pine omits them.
 //
-// 3. Order comment updated: includes entry_type (MR/C) alongside score.
-//    Format: HAWK|<strategy_id>|<entry_type><score>
+// 3. Version strings updated to v2.42.0 throughout.
 //
-// 4. BACKSTOP_HIT CRITICAL alert reinstated for LONG_STOP / SHORT_STOP actions.
-//    Was removed when trailing stop was firing constantly. Now safe to restore.
-//
-// 5. Version strings corrected throughout (ENGINE_READY and STARTUP_COMPLETE
-//    still said v2.38.2 — carried forward in error from earlier versions).
-//
-// Supabase schema changes required (run before deploying this engine):
-//    See Hawksphere clean start SQL in the strategy development session log.
-//    Execute archive → truncate → rename → drop → add columns in sequence.
-//    Do NOT deploy this engine against the v6 schema — logSignal() will fail.
+// Supabase schema changes required BEFORE deploying this engine:
+//    Run hawk_btc_v83_epoch.sql (new epoch clean start + 7 new columns).
+//    Do NOT deploy against old schema — logSignal() insert will fail on
+//    columns that do not yet exist.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── PREVIOUS: v2.41.0 — v7.1.5 PAYLOAD ALIGNMENT + FIXED BACKSTOP ──────────
+// 1. logSignal() field mapping overhaul (entry_type, cloud_dist_atr, etc.)
+// 2. ProtoOANewOrderReq: removed trailingStopLoss:true. Fixed backstop only.
+// 3. Order comment: HAWK|<strategy_id>|<entry_type><score>
+// 4. BACKSTOP_HIT CRITICAL alert reinstated for LONG_STOP / SHORT_STOP.
+// 5. Version strings corrected throughout.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── CHANGE v2.38.1 #1 of 3 ───────────────────────────────────────────────────
@@ -38,7 +37,7 @@ const { CTraderConnection } = require('@reiryoku/ctrader-layer');
 const { createClient }      = require('@supabase/supabase-js');
 const express               = require('express');
 
-console.log('=== HAWK ENGINE v2.41.0 STARTING ===');
+console.log('=== HAWK ENGINE v2.42.0 STARTING ===');
 
 const UPSTASH_URL       = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN     = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -279,6 +278,14 @@ async function logSignal(signal, result, status, errorMsg, latencyMs) {
       bars_since_flat:     signal.bars_since_flat     != null ? parseInt(signal.bars_since_flat)      : null,
       trend_aligned:       signal.trend_aligned       != null ? parseInt(signal.trend_aligned)        : null,
       ghost_bars_active:   signal.ghost_bars_active   != null ? parseInt(signal.ghost_bars_active)    : null,
+      // ── v8.3 NEW FIELDS ──────────────────────────────────────────────────────
+      utc_hour:            signal.utc_hour            != null ? parseInt(signal.utc_hour)             : null,
+      dow_utc:             signal.dow_utc             != null ? parseInt(signal.dow_utc)              : null,
+      ar_char:             signal.ar_char             || null,
+      kijun_dist_atr:      signal.kijun_dist_atr      != null ? parseFloat(signal.kijun_dist_atr)    : null,
+      stop_dist_atr:       signal.stop_dist_atr       != null ? parseFloat(signal.stop_dist_atr)     : null,
+      backstop_level:      signal.backstop_level      != null ? parseFloat(signal.backstop_level)    : null,
+      utc_hour_exit:       signal.utc_hour_exit       != null ? parseInt(signal.utc_hour_exit)       : null,
       // ── REMOVED from v6.0.3 (not in v7.1.5 payload) ─────────────────────────
       // ema_mod, slowk_mod → replaced by chandelier_mod and d6_mod above
       // d1, d2, d3_raw, d4, d5, d5_inv, d6, d7 → D-gate architecture retired
@@ -750,13 +757,13 @@ async function connectToCTrader() {
     setInterval(function() { connection.sendHeartbeat(); }, 25000);
     isConnected = true; reconnecting = false;
     console.log('=== ENGINE READY | Mode:', IS_PAPER ? 'PAPER' : 'LIVE', '===');
-    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.41.0 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+    await logAlert('ENGINE_READY', 'INFO', 'Engine v2.42.0 connected. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
     await closeAllOpenPositions();
     setInterval(runWatchdog, 10 * 60 * 1000);
     querySymbolSchedules().catch(function(e) { console.error('Symbol schedule query error:', e.message); });
     var startupElapsedMs = Date.now() - (global.engineStartMs || Date.now());
     await logAlert('STARTUP_COMPLETE', 'INFO',
-      'Engine v2.41.0 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
+      'Engine v2.42.0 startup complete in ' + startupElapsedMs + 'ms. Mode: ' + (IS_PAPER ? 'PAPER' : 'LIVE'));
   } catch (err) {
     var msg = (err && err.message) ? err.message : JSON.stringify(err);
     console.error('cTrader connection failed:', msg);
@@ -926,12 +933,15 @@ async function executeSignal(signal) {
       + ' | signal_id:' + (signal.signal_id || 'UNKNOWN') + '. Check Railway logs and cTrader connection.');
     await logSignal(signal, null, 'ERROR', 'Engine not connected', latencyMs); return;
   }
-  var action  = signal.action;
-  var isEntry = action === 'LONG' || action === 'SHORT';
-  var isExit  = action === 'LONG_EXIT'      || action === 'SHORT_EXIT'    ||
-                action === 'LONG_STOP'      || action === 'SHORT_STOP'    ||
-                action === 'LONG_MKT_CLOSE' || action === 'SHORT_MKT_CLOSE';
-  var isLong  = action === 'LONG' || action === 'LONG_EXIT' || action === 'LONG_STOP' || action === 'LONG_MKT_CLOSE';
+  var action     = signal.action;
+  var isEntry    = action === 'LONG' || action === 'SHORT';
+  var isReversal = action === 'LONG_R_REV' || action === 'SHORT_R_REV';
+  var isExit     = action === 'LONG_EXIT'      || action === 'SHORT_EXIT'    ||
+                   action === 'LONG_STOP'      || action === 'SHORT_STOP'    ||
+                   action === 'LONG_MKT_CLOSE' || action === 'SHORT_MKT_CLOSE';
+  // R_REV: isLong reflects the NEW direction being opened (the reversal target)
+  var isLong     = action === 'LONG' || action === 'LONG_R_REV' ||
+                   action === 'LONG_EXIT' || action === 'LONG_STOP' || action === 'LONG_MKT_CLOSE';
   var ctSymbol  = SYMBOL_MAP[signal.ticker] || signal.ticker;
   var symbolId  = symbolIdMap[ctSymbol];
   var tradeSide = isLong ? 'BUY' : 'SELL';
@@ -983,6 +993,74 @@ async function executeSignal(signal) {
       }
       setTimeout(function() { reconcileConfirm(dbId, symbolId, isLong); }, 2000);
       setTimeout(function() { queryRecentDeals(ctSymbol, dbId, symbolId, signal); }, 4000);
+    } else if (isReversal) {
+      // R_REV: close the existing C position in the OPPOSITE direction, then open R in the new direction.
+      // isLong reflects the NEW direction. The existing position is in the opposite side.
+      var existingSide = isLong ? 'SELL' : 'BUY';
+      var posResRev    = await connection.sendCommand('ProtoOAReconcileReq', { ctidTraderAccountId: ACCOUNT_ID });
+      var revPosition  = (posResRev.position || []).find(function(p) {
+        return String(p.tradeData && p.tradeData.symbolId) === String(symbolId)
+          && p.tradeData && p.tradeData.tradeSide === existingSide;
+      });
+      if (!revPosition) {
+        console.log('[R_REV] No existing', existingSide, 'position to reverse for', ctSymbol, '— skipping');
+        await logSignal(signal, null, 'NO_POSITION', 'R_REV: no existing ' + existingSide + ' position to close', latencyMs);
+        return;
+      }
+      var revPositionId = String(revPosition.positionId);
+      console.log('[R_REV] Closing', existingSide, 'positionId:', revPositionId, 'then opening', isLong ? 'LONG' : 'SHORT');
+      // Log the close leg
+      var revCloseDbId = await logSignal(signal, { positionId: revPositionId }, 'PENDING_CLOSE', null, latencyMs);
+      try {
+        await connection.sendCommand('ProtoOAClosePositionReq', {
+          ctidTraderAccountId: ACCOUNT_ID,
+          positionId:          revPosition.positionId,
+          volume:              revPosition.tradeData.volume,
+        });
+        console.log('[R_REV] Close sent for positionId:', revPositionId);
+        await logAlert('R_REV_CLOSE', 'INFO',
+          'R_REV close sent | ticker: ' + ctSymbol + ' | closed: ' + existingSide
+          + ' positionId: ' + revPositionId + ' | opening: ' + (isLong ? 'LONG' : 'SHORT'));
+      } catch (closeErr) {
+        console.error('[R_REV] Close error:', closeErr.message);
+        await supabase.from('signal_log').update({ status: 'ERROR', error_message: closeErr.message }).eq('id', revCloseDbId);
+        await logAlert('R_REV_CLOSE_FAILED', 'CRITICAL',
+          'R_REV close FAILED | ticker: ' + ctSymbol + ' | positionId: ' + revPositionId
+          + ' | error: ' + closeErr.message + ' | New entry NOT sent — manual intervention required.');
+        return;
+      }
+      // Brief pause to allow cTrader to process the close before opening the new position
+      await new Promise(function(resolve) { setTimeout(resolve, 500); });
+      // Open the new R position
+      var revVolume   = resolveVolume(signal);
+      var revStopLoss = resolveStopLoss(signal);
+      if (revVolume === 0) {
+        await logSignal(signal, null, 'SKIPPED', 'R_REV: zero volume on new entry — review lot size', latencyMs);
+        return;
+      }
+      var revEntryDbId = await logSignal(signal, { symbolId, volume: revVolume, stopLoss: revStopLoss }, 'PENDING_FILL', null, latencyMs);
+      var revTradeSide = isLong ? 'BUY' : 'SELL';
+      if (revEntryDbId) registerPending(symbolId, revTradeSide, revEntryDbId);
+      try {
+        await connection.sendCommand('ProtoOANewOrderReq', {
+          ctidTraderAccountId: ACCOUNT_ID, symbolId, orderType: 'MARKET',
+          tradeSide: revTradeSide, volume: revVolume,
+          relativeStopLoss: revStopLoss,
+          comment: 'HAWK|' + signal.strategy_id + '|R_REV' + (signal.score || '7'),
+        });
+        console.log('[R_REV] New entry sent | ticker:', ctSymbol, '| side:', revTradeSide, '| volume:', revVolume);
+      } catch (entryErr) {
+        console.error('[R_REV] New entry error:', entryErr.message);
+        if (revEntryDbId) resolvePending(symbolId, revTradeSide);
+        await supabase.from('signal_log').update({
+          status: 'ERROR', error_message: 'R_REV entry failed after close: ' + entryErr.message,
+        }).eq('id', revEntryDbId);
+        await logAlert('R_REV_ENTRY_FAILED', 'CRITICAL',
+          'R_REV entry FAILED after successful close | ticker: ' + ctSymbol
+          + ' | error: ' + entryErr.message + ' | Position now FLAT — manual check required.');
+      }
+      setTimeout(function() { reconcileConfirm(revEntryDbId, symbolId, isLong); }, 2000);
+      setTimeout(function() { queryRecentDeals(ctSymbol, revEntryDbId, symbolId, signal); }, 4000);
     } else if (isExit) {
       // v2.41.0: fire CRITICAL alert on backstop hit actions (fixed stop, not trailing)
       if (action === 'LONG_STOP' || action === 'SHORT_STOP') {
